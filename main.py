@@ -35,7 +35,7 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
 
 # Загрузка конфигурации
 load_dotenv()
-ADMIN_ID = int(getenv("ADMIN_ID"))
+ADMIN_ID = getenv("ADMIN_ID")
 TELEGRAM_TOKEN = getenv("TELEGRAM_TOKEN")
 
 # Настройка Gemini
@@ -124,7 +124,7 @@ async def start(message: Message):
 
 # Проверка времени работы
 @dp.message(Command("run_info"))
-async def cmd_info(message: Message, started_at: str):
+async def run_info(message: Message, started_at: str):
 	"""Обработчик команды /run_info для отображения времени запуска бота."""
 	await message.answer(f"Бот запущен {started_at}")
 
@@ -728,28 +728,43 @@ async def get_top_users(message: Message, count: int = 10, table_text=None) -> l
 		result.append((user_id, score, name))	
 	
 	if len(arg) > 2 and arg[2].lower() == 't':
+		# Константы для максимальной длины колонок
+		MAX_LEN = 30
+		MAX_PLACE_LEN = 2  # Для медалек или номеров (1-99)
+		MAX_SCORE_LEN = 6  # Например, "1.23M", "99.9k", "9999"
+
+		# Вычисляем оставшееся место для имени: общая длина - место - пробел - счет - пробел
+		MAX_DISPLAY_NAME_LEN = MAX_LEN - MAX_PLACE_LEN - 1 - MAX_SCORE_LEN - 1 
 		# Формируем текст-таблицу
 		table_text = f"<b>{title}</b>\n" # Заголовок жирным
 		
-		# Определяем максимальную ширину для каждого столбца
-		# Столбцы: Место, Имя, Счет
-		max_place_len = len(str(count)) # Максимальная длина номера места
-		max_name_len = max(len(item[2]) for item in result) if result else 0
-		max_score_len = max(len(str(item[1])) for item in result) if result else 0
+		# Начало моноширинного блока
+		table_text += "<pre>\n"
 
-		# Заголовки столбцов
-		# header = f"{'Место'.ljust(max_place_len)} | {'Имя'.ljust(max_name_len)} | {'Счет'.ljust(max_score_len)}"
-		# separator = "-" * len(header) # Линия-разделитель
-		# table_text += f"<pre>{header}\n{separator}\n"
-		# table_text += f"<pre>"
 		# Добавляем строки с данными
 		for i, item in enumerate(result):
-			place = str(i + 1).ljust(max_place_len)
-			name = item[2].ljust(max_name_len)
-			score = humanize_value_for_chars(item[1]).ljust(max_score_len)
-			table_text += f"{place} {name} {score}\n"
+			if i == 0:
+				place = "🥇"
+			elif i == 1:
+				place = "🥈"
+			elif i == 2:
+				place = "🥉"
+			else:
+				place_num = str(i + 1)
+				if len(place_num) > MAX_PLACE_LEN:
+					place = ".."
+				else:
+					place = str(i + 1).ljust(MAX_PLACE_LEN)
 
-		# table_text += "</pre>"
+			if len(item[2]) > MAX_DISPLAY_NAME_LEN:
+				# Если имя слишком длинное, обрезаем его
+				name = item[2][:MAX_DISPLAY_NAME_LEN - 2] + ".."
+			name = item[2].ljust(MAX_DISPLAY_NAME_LEN)
+			score = humanize_value_for_chars(item[1]).ljust(MAX_SCORE_LEN)
+			table_text += f"{place} {name} {score}\n"
+		# Закрываем моноширинный блок
+		table_text += "</pre>\n"
+
 		# Отправляем сообщение с текстом-таблицей
 		await message.answer(table_text, parse_mode='HTML')
 
@@ -901,6 +916,16 @@ async def cmd_info(message: Message):
 		await r.set(f"chat:{message.chat.id}:Hello_msg",message.md_text.split(' ', 1)[1])
 		await message.reply(f"🫡")
 
+def escape_markdown_v2(name: str) -> str:
+	"""Экранирует специальные символы MarkdownV2 в тексте."""
+	# Для простоты, сначала можно экранировать все символы, которые имеют значение в MarkdownV2.
+    # Если вы не используете эти символы для форматирования внутри FNAME, то экранирование их будет безопасным.
+    # pattern = r"([_*\[\]()~`>#+\-=|{}.!])"
+    # return re.sub(pattern, r"\\\1", text)
+	chars_to_escape = '_*[]()~`>#+-=|{}.!' # Включаем все, что может быть проблемой
+	escaped_text = "".join(['\\' + char if char in chars_to_escape else char for char in name])
+	return escaped_text
+
 # Слушать сообщения чата
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), ~F.text.startswith('/')) # Игнорируем команды
 async def save_group_message(message: Message):
@@ -935,7 +960,8 @@ async def save_group_message(message: Message):
 							if description==True:
 								await user_lock_unlock(user_id, message.chat.id, st="unlock")
 								user_obj = await bot.get_chat(chat_id=user_id)
-								FNAME=user_obj.full_name or "No_Name"
+								FNAME = user_obj.full_name or "No_Name"
+								FNAME = escape_markdown_v2(FNAME)
 								try:
 									hell_msg = await r.get(f"chat:{chat.id}:Hello_msg")
 									hell_msg = hell_msg.replace('FNAME', FNAME)
