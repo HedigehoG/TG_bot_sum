@@ -16,18 +16,21 @@ from dotenv import load_dotenv
 from os import getenv
 import random
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION, CommandObject
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, ChatMemberRestricted, ChatMemberLeft, \
 	ChatMemberBanned, ChatMemberMember, ChatPermissions, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, \
 	Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.exceptions import TelegramForbiddenError
 
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import imagehash
-import google.generativeai as genai
+
+from google import genai
+from google.genai import types as gtypes
 
 # Настройка базовой конфигурации логирования
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', 
@@ -40,8 +43,7 @@ TELEGRAM_TOKEN = getenv("TELEGRAM_TOKEN")
 
 # Настройка Gemini
 GOOGLE_API_KEY = getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')
+gclient = genai.Client(api_key=GOOGLE_API_KEY)
 
 #RAPIDAPI_KEY = getenv("RAPIDAPI_KEY")
 REDIS_HOST = getenv("REDIS_HOST", "localhost")
@@ -63,7 +65,7 @@ SEND_MES_GROUP = 5  # число запросов в 24ч
 VERIFICATION_REM = 1  # час
 BAN_AFTER_HOURS = 20  # часов до бана
 
-BAYANDIFF = 5 # разница хешей картинок
+BAYANDIFF = 3 # разница хешей картинок
 
 # Инициализация 
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -131,13 +133,13 @@ async def run_info(message: Message, started_at: str):
 
 # тест комады 
 @dp.message(Command("t2"))
-async def cmd2(message: types.Message):
+async def cmd2(message: Message):
 	await message.answer("1")
 
 
 # Проверка прав
 @dp.message(Command("right"))
-async def get_perm(message: types.Message):
+async def get_perm(message: Message):
 	"""Проверяет права бота или пользователя, на сообщение которого был дан ответ."""
 	chat_id = message.chat.id
 	user_id_to_check = None
@@ -205,7 +207,7 @@ async def del_msg_delay(smg_obj, timer=7):
 
 # Обработка комады summarize
 @dp.message(Command("sum"))
-async def summarize(message: Message):
+async def summarize(message: Message, command: CommandObject): # <-- Изменили сигнатуру
 	logging.info(f"Команда summarize вызвана в чате: {message.chat.title}")
 	if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
 		await message.answer("Эта команда работает только в групповых чатах!")
@@ -217,7 +219,8 @@ async def summarize(message: Message):
 	chat_Ti = message.chat.title
 
 	# Проверка на доступ у чата и юзера
-	req = await is_user_approved(chat_id, user_id)
+	# req = await is_user_approved(chat_id, user_id)
+	req = 'on' # Для тестов, чтобы не проверять в бд
 
 	if req == 'on':
 		# 1. Проверяем, занят ли чат
@@ -227,18 +230,28 @@ async def summarize(message: Message):
 
 		# 2. Добавляем чат в список обрабатываемых (захватываем блокировку)
 		LOCK_FOR_SUMMARIZE.add(chat_id)
-		params = message.text.split()[1:]  # Получаем все параметры после команды
+
+		# --- НОВАЯ, УЛУЧШЕННАЯ ЛОГИКА ПАРСИНГА ---
+		args = command.args.split() if command.args else []
+		
+		# Ищем флаг приватности. Он может быть '-p' или 'private'.
+		is_private = '-p' in args or 'private' in args
+		
+		# Отфильтровываем все флаги, оставляя только числовые параметры
+		numeric_params = [p for p in args if p not in ['-p', 'private']]
+		
 		num_messages = 0
 		offset = 0
 
 		try:
-			if len(params) >= 1:
-				num_messages = int(params[0])
+			if len(numeric_params) >= 1:
+				num_messages = int(numeric_params[0])
 				num_messages = max(MIN_TO_GPT, min(num_messages, MAX_TO_GPT))
-			if len(params) >= 2:
-				offset = int(params[1])
+			if len(numeric_params) >= 2:
+				offset = int(numeric_params[1])
 
-			await process_summarize(message, num_messages, offset)
+			# Передаем новый флаг в вашу основную функцию
+			await process_summarize(message, num_messages, offset, privat=is_private)
 
 		except ValueError:
 			await del_msg_delay(await message.answer(f"Некорректное число сообщений. Использую {DEF_SUM_MES}."))
@@ -300,20 +313,25 @@ def auto_gpt_mes_count(value):
 
 
 # Делаем суммаризацию
-async def process_summarize(message: Message, count=0, start=0):
+async def process_summarize(message: Message, count=0, start=0, privat: bool = False):
 	chat = message.chat
 	chat_id = chat.id
-	chat_nm = chat.username or chat.title
 	user = message.from_user
+
+	# <--- 2. Определяем, куда отправлять ответ
+	if privat:
+		target_chat_id = user.id
+	else:
+		target_chat_id = chat.id
+	
 	new_messages = []
 	msg_old_id = None	
 
 	ttl = await check_daily_limit(chat_id, user.username)
-	#ttl = 9990
-	if (ttl > 0): # and (user.id not in ADMIN_IDS):
-		await del_msg_delay(await message.answer(f"❌ Достигнут лимит запросов!\n Подождите {format_seconds(ttl)}"))
+	if (ttl > 0):
+		await del_msg_delay(await message.answer(f"❌ Достигнут лимит запросов суммаризации!\n Подождите {format_seconds(ttl)}"))
 		return
-
+	
 	try:
 		key = f"chat:{chat_id}:history"
 		logging.info(f"Проверка получения последнего сообщения из: {key}")
@@ -373,25 +391,52 @@ async def process_summarize(message: Message, count=0, start=0):
 		surl = f'Предыдущий свод [тут]({turl}{last_sum_id})'
 	else:
 		surl = ''
+
+	typing_task = None # Инициализируем переменную для задачи
 	try:
-		await bot.send_chat_action(chat_id, action="typing")
+		# 1. Создаем и запускаем фоновую задачу, которая будет слать "typing"
+		async def send_typing_periodically():
+			"""Отправляет 'typing' каждые 4 секунды, пока не будет отменена."""
+			while True:
+				await bot.send_chat_action(target_chat_id, action="typing")
+				await asyncio.sleep(4) # Пауза 4 секунды (безопасно меньше лимита Telegram)
+
+		typing_task = asyncio.create_task(send_typing_periodically())
+
 		logging.info(f"передача 1msg-{messages[0]}\n"
 			   		f"число-{count}, last_sum_id-{surl}, msg_old_id-{msg_old_id}")
 		summary = await get_gpt4_summary(messages, turl)
 		logging.info(f"Ответ gpt4: получен. Длина {len(summary)}")
-		
-		sum = await message.answer(f"📝 #Суммаризация последних {count} сообщений:\n{summary}" \
-								   f"\n{surl}",
-									disable_web_page_preview=True, ## убираем превью
-									parse_mode=ParseMode.MARKDOWN  # Используй ParseMode.MARKDOWN
-									)
+		await r.lpush('gpt_answ_t', json.dumps(summary))
 
+		if typing_task:
+			typing_task.cancel()
+
+		# <--- 4. Используем bot.send_message для отправки в target_chat_id
+		sum_text = f"📝 #Суммаризация последних {count} сообщений из чата {chat.title}:\n{summary}"
+		if surl and not privat: # Добавляем ссылку на пред. свод только если постим в чат
+			sum_text += f"\n{surl}"
+
+		sum = await bot.send_message(
+			chat_id=target_chat_id,
+			text=sum_text,
+			disable_web_page_preview=True,
+			parse_mode=ParseMode.MARKDOWN
+		)
+
+	# <--- 5. Обработка ошибки, если бот не может написать в личку
+	except TelegramForbiddenError:
+		logging.error(f"Не удалось отправить сообщение пользователю {user.id}. Бот заблокирован или чат не начат.")
+		await message.answer("Не всё так просто, спроси сам знаешь кого ))")
+		return
 	except Exception as e:
-		logging.error(f"GPT error: {e}")
-		await message.answer("Ошибка получения данных от GPT")
-		return	
-		
-	# Обновляем дневной лимит
+		logging.error(f"AI or sending error: {e}")
+		await message.answer("Ошибка получения данных от AI или отправки сообщения.")
+		return
+	finally:
+		if typing_task:
+			typing_task.cancel()
+
 	await upd_daily_limit(chat_id, user.username)
 	
 	if new_messages:
@@ -457,51 +502,68 @@ async def upd_daily_limit(chat_id: int, user_id: int):
 
 
 # Запрос к ИИ
-async def get_gpt4_summary(text: str, turl: str) -> str:
+async def get_gpt4_summary(text: list, turl: str) -> str:
 	#return f"Jlsdgssdgdfhdh\n"	
 	# MAX_SUM = auto_gpt_mes_count(count)
 
 	# Задаем системную инструкцию при создании модели
-	prompt=f"""	Ты - опытный и остроумный пересказчик событий из Telegram-чата.
-	Сделай стиль рассказа лёгким и неформальным, отражающим дружелюбную атмосферу чата. Добавляй эмодзи, чтобы разбавить текст.
-	Твоя задача:
-	 — Прочитать поток сообщений.
-	 — Выделить несколько ключевых тем, вынеся в заголовки (используй * для заголовков) и расскажи что происходило
-	При этом нужно учитывать следующие моменты:
-	- Каждое сообщение представлено в формате JSON с полями "id", "reply_to" (может отсутствовать), "user_name", "full_name", и "text".
-	- Поле "reply_to" содержит id сообщения, на которое данное сообщение является ответом (если это ответ). Отсутствие поля означает, что сообщение является ответом на предыдущее (с меньшим id), но нужно смотреть контекст.
-	- Всегда упоминай пользователей по полному имени (поле "full_name").
-	  - Если user_name не равен "non", оформляй имя пользователя как [full_name](t.me/user_name).
-	  - Если user_name равен "non" или "БезыНя-шка", упоминай пользователя только по полному имени: full_name.
-	- Важные моменты/фразы из сообщений пересказывай и оформляй как кликабельные ссылки на соответствующие сообщения. Используй стандартный Markdown формат [текст ссылки](URL).
-	- Текст ссылки: краткая фраза или слово из сообщения, которое ты пересказываешь.
-	- URL: полный адрес сообщения в формате {turl}id, где {turl} - базовая часть URL чата (передается тебе отдельно), а id - значение поля "id" из JSON-сообщения.
-	Пример правильного формата: [объявил о начале]({turl}397) - здесь в скобках `()` ТОЛЬКО URL.
-	
-	И добвавь в конце "Если пропустил несколько сообщений — не страшно. Здесь обсуждали" продолжив фразу
-	И ещё одно правило, нельзя превышать 3700 символов, где каждая буква 1 символ и смайлик это всего 4 символа
-	"""
+	#первая строка должна быть такой: `--- cut here ---` будет служить для "отрезки лишнего"
+	prompt=f"""
+### Роль
+Здарова! Ты — Король пересказов, лучший кореш, который всегда в курсе всех движух в чате. Твоя суперсила — быстро просекать, о чём базар, и превращать скучную переписку в огненный, интерактивный дайджест. Хватит читать всю эту нудятину — ты делаешь из неё сок!
 
-	await r.lpush('gpt_answ', json.dumps(text))
-	
-	model = genai.GenerativeModel(
-		model_name='gemini-2.0-flash', # Или другая модель
-		# Задаем системную инструкцию при создании модели
-		system_instruction=prompt
-	)
+### ❗ ВАЖНО: Настрой меня перед запуском!
+Перед тем как отдать мне данные, **ЗАМЕНИ** плейсхолдер `CHAT_BASE_URL` на базовую ссылку на этот чат. Это нужно, чтобы я мог делать кликабельные ссылки на сообщения.
 
-	try:      
-		# Генерируем контент асинхронно
-		response = await model.generate_content_async({
-				'mime_type': 'text/plain',  # Указываем mime_type
-				'data': json.dumps(text).encode('utf-8')
-			})
+**Моя настройка для этого чата:**
+`CHAT_BASE_URL = "{turl}"`
 
-		return response.text or None
+### Задача
+Проанализируй этот кусок чата в JSONL и сделай чёткий, весёлый и **интерактивный** краткий пересказ. Покажи, кто зажигал, а кто был в танке, и дай ссылки на самые сочные моменты.
+
+### Как должен выглядеть твой отчёт (СЛУШАЙ ВНИМАТЕЛЬНО!):
+Твой пересказ — это крутой пост в Markdown.
+
+1.  **Заголовок с эмодзи.** Никаких "Названий темы". Вместо этого — **жирный заголовок и пара подходящих эмодзи в начале**.
+
+2.  **Никаких списков "Участники".** Сразу после заголовка — сочный пересказ на 2-5 предложения.
+
+3.  **Имена и ссылки на юзеров.**
+	*   Бери имя из поля `full_name` (например, из "Valery Gordienko" делай **Валерий**, Анджела Аргунова - Анджела, и т.д.) и смотри без ошибок!!! а то я тебя знаю любишь писать АнЖела вместо АнДжела 😅.
+	*   **Фишка в том**, что при **первом** упоминании имени в **любом** из пересказов, ты делаешь его кликабельной ссылкой, а в следующих упоминаниях без ссылок, можешь выделять просто жирным, если тебе так хочется
+	*   Формат такой: `[Имя](t.me/user_name)`.
+	*   Делай это только для тех, у кого `user_name` **не** `None`. Если юзера нет, имя остается просто текстом.
+
+4.  **Ссылки на сообщения.**
+	*   Забудь про скучные `[id:...]`! Вместо этого делай живую ссылку прямо из текста.
+	*   Возьми ключевую фразу из сообщения (1-3 слова) и сделай её ссылкой. Формат: `[ключевая фраза](CHAT_BASE_URL/id)`.
+
+5.  **Тон — наше всё!** Пиши так, будто рассказываешь другу, что он пропустил. С иронией, подколками, вставляя смайлики для красоты и эмоций.
+
+6. **Пределы** Если текста для анализа много и много интересных тем и ты не знаешь что оставить, не переживай можешь добавить ещё чуток. **Главное ограничение** это число символов в твоем пересказе, оно **не должно превышать 3900 символов**
+
+Давай, жги! Разбери этот чат по косточкам.
+"""
+
+	# await r.lpush('gpt_answ', json.dumps(text).encode('utf-8'))
+	# logging.info(text[:50])  # Логируем первые 50 символов текста
+	try:
+		response = await gclient.aio.models.generate_content(
+			model="gemini-2.5-flash",
+			config=gtypes.GenerateContentConfig(
+				tools=[
+					gtypes.Tool(url_context=gtypes.UrlContext()),
+				],
+				thinking_config=gtypes.ThinkingConfig(thinking_budget=-1),
+				system_instruction=prompt,  # Системная инструкция
+				),
+			contents=json.dumps(text),  # Описание, текст в формате JSON
+			)
+		return response.text #.rsplit('--- cut here ---', 1)  # Возвращаем текст после "отрезки"
 
 	except Exception as e:
-		logging.error(f"Ошибка в gpt generate_content_async: {e}")
-		return None, f"Ошибка при обращении к Gemini: {e}"
+		logging.error(f"Произошла ошибка при обращении к Gemini: {e}", exc_info=True)
+		# return f"Ошибка при генерации сводки: {e}"
 			
 
 # Обработка подтверждения/отказа запроса
@@ -641,7 +703,10 @@ async def send_fun_mes(message: Message):
 		contents = f"Придумай короткий анекдот по событиям данной переписки: {txt}"	
 	
 	# Генерируем контент асинхронно
-	response = await model.generate_content_async(contents=contents)
+	response = await gclient.aio.models.generate_content(
+		model="gemini-2.5-flash",
+		contents=contents,
+	)
 	await message.answer(response.text or "Всё плохо")
 	await r.set(key1, 'gemini', ex=300)
 
@@ -691,88 +756,136 @@ async def generate_pil_image(top_users, title):
 	return output
 
 @dp.message(Command("top_u"))
-async def get_top_users(message: Message, count: int = 10, table_text=None) -> list:
-	chat_id = message.chat.id
-	arg = message.text[6:].split()
+async def get_top_users(message: Message, command: CommandObject) -> list:
+	chat_id = message.chat.id	
+	
+	# --- 1. Гибкий парсинг аргументов ---
+	args = command.args.split() if command.args else []
 
-	if len(arg) > 1 and arg[1] is not None:
-		try:
-			count = int(arg[1])
-		except ValueError:
-			await message.answer('Вторым значением должно быть число топа (по дефолту 10)')
+	# Значения по умолчанию
+	stat_type = 'm'
+	count = 10
+	output_type = 't'
+	period = 'all_time'
+	
+	# Перебираем аргументы и определяем их по формату
+	for arg in args:
+		if arg in ['m', 'c', 'b', 'e']:
+			stat_type = arg
+		elif arg.isdigit():
+			count = int(arg)
+		elif arg in ['p', 't']:
+			output_type = arg
+		elif re.match(r"^\d{4}-\d{2}$", arg) or arg == 'all':
+			period = arg
 
-	if len(arg) == 0 or arg[0] == 'm':
-		key = f"chat:{chat_id}:count_u_msg"
-		title = f"Топ {count} отправлятелей сообщений"
-	elif arg[0] == 'c':
-		key = f"chat:{chat_id}:count_u_len"
-		title = f"Топ {count} печатателей буков"
-	elif arg[0] == 'b':
-		key = f"chat:{chat_id}:count_u_byn"
-		title = f"Топ {count} баянистов"
-	else:
-		await message.answer('Всё не так! Нудно команда и через пробел параметры - буква топа (m,c,b), число топа (по дефолту 10)')
+	# --- 2. Обновленный мануал ---
+	if not command.args:
+		manual = (
+			"📋 <b>Команда /top_u</b>\n"
+			"Показывает топ пользователей по активности в чате.\n\n"
+			"<b>Формат:</b> /top_u [тип] [число] [период] [вывод]\n"
+			"Аргументы можно указывать в любом порядке.\n\n"
+			"<b>Типы топа:</b>\n"
+			"  `m` - по сообщениям (по умолч.)\n"
+			"  `c` - по символам\n"
+			"  `b` - по баянам\n"
+			"  `e` - по эффективности (спам-рейтинг)\n"
+			"<b>Число:</b> кол-во юзеров в топе (по умолч. 10)\n"
+			"<b>Период:</b> `ГГГГ-ММ` (напр. `2025-07`) или `all` (за всё время, по умолч.)\n"
+			"<b>Вывод:</b> `t` - текст (по умолч.), `p` - картинка\n\n"
+			"<b>Примеры:</b>\n"
+			"`/top_u m 5` - топ-5 по сообщениям за всё время\n"
+			"`/top_u e 10 p 2024-06` - спам-топ за июнь картинкой"
+		)
+		await message.answer(manual, parse_mode='HTML')
 		return
 
-	top_users = await r.zrevrange(key, 0, count - 1, withscores=True)
-	result = []
-	for user_id_bytes, score in top_users:
-		user_id = user_id_bytes
-		score = int(score)
-		# Получаем имя пользователя через ChatMember
-		try:
-			member = await bot.get_chat_member(chat_id, int(user_id))
-			name = member.user.full_name or "No_Name"
-		except:
-			name = "Unknown"
-		result.append((user_id, score, name))	
+	# --- 3. Динамическое формирование ключей и заголовков ---
+	period_str = "всё время" if period == 'all_time' else f"период {period}"
 	
-	if len(arg) > 2 and arg[2].lower() == 't':
-		# Константы для максимальной длины колонок
-		MAX_LEN = 30
-		MAX_PLACE_LEN = 2  # Для медалек или номеров (1-99)
-		MAX_SCORE_LEN = 6  # Например, "1.23M", "99.9k", "9999"
+	type_map = {
+		'm': 'msg',
+		'c': 'len',
+		'b': 'byn'
+	}
+	title_map = {
+		'm': f"Топ {count} по сообщениям за {period_str}",
+		'c': f"Топ {count} по символам за {period_str}",
+		'b': f"Топ {count} баянистов за {period_str}",
+		'e': f"Топ {count} по эффективности за {period_str} (спам-рейтинг)"
+	}
 
-		# Вычисляем оставшееся место для имени: общая длина - место - пробел - счет - пробел
-		MAX_DISPLAY_NAME_LEN = MAX_LEN - MAX_PLACE_LEN - 1 - MAX_SCORE_LEN - 1 
-		# Формируем текст-таблицу
-		table_text = f"<b>{title}</b>\n" # Заголовок жирным
+	title = title_map.get(stat_type)
+	result = []
+
+	# --- 4. Логика получения данных ---
+	if stat_type in ['m', 'c', 'b']:
+		redis_key_suffix = type_map[stat_type]
+		key = f"chat:{chat_id}:count_u_{redis_key_suffix}:{period}"
 		
-		# Начало моноширинного блока
-		table_text += "<pre>\n"
+		top_users_raw = await r.zrevrange(key, 0, count - 1, withscores=True)
+		for user_id_bytes, score in top_users_raw:
+			score = int(score)
+			try:
+				member = await bot.get_chat_member(chat_id, int(user_id_bytes))
+				name = member.user.full_name or "No_Name"
+			except Exception:
+				name = f"ID:{user_id_bytes}" # Пользователь мог покинуть чат
+			result.append((user_id_bytes, score, name))
 
-		# Добавляем строки с данными
-		for i, item in enumerate(result):
-			if i == 0:
-				place = "🥇"
-			elif i == 1:
-				place = "🥈"
-			elif i == 2:
-				place = "🥉"
-			else:
-				place_num = str(i + 1)
-				if len(place_num) > MAX_PLACE_LEN:
-					place = ".."
-				else:
-					place = str(i + 1).ljust(MAX_PLACE_LEN)
+	elif stat_type == 'e':
+		key_msg = f"chat:{chat_id}:count_u_msg:{period}"
+		key_len = f"chat:{chat_id}:count_u_len:{period}"
+		
+		user_msg_counts = await r.zrange(key_msg, 0, -1, withscores=True)
+		efficiency_list = []
+		MIN_MESSAGES = 10  # Минимальное кол-во сообщений для учета
 
-			if len(item[2]) > MAX_DISPLAY_NAME_LEN:
-				# Если имя слишком длинное, обрезаем его
-				name = item[2][:MAX_DISPLAY_NAME_LEN - 2] + ".."
-			name = item[2].ljust(MAX_DISPLAY_NAME_LEN)
-			score = humanize_value_for_chars(item[1]).ljust(MAX_SCORE_LEN)
-			table_text += f"{place} {name} {score}\n"
-		# Закрываем моноширинный блок
-		table_text += "</pre>\n"
+		for user_id_bytes, msg_count in user_msg_counts:
+			if msg_count < MIN_MESSAGES:
+				continue
+			
+			char_count = await r.zscore(key_len, user_id_bytes)
+			if char_count is not None and msg_count > 0:
+				efficiency = float(char_count) / msg_count
+				efficiency_list.append((user_id_bytes, efficiency))
 
-		# Отправляем сообщение с текстом-таблицей
+		efficiency_list.sort(key=lambda x: x[1]) # Сортируем по возрастанию
+		top_efficiency = efficiency_list[:count]
+
+		for user_id, efficiency_score, in top_efficiency:
+			try:
+				member = await bot.get_chat_member(chat_id, int(user_id))
+				name = member.user.full_name or "No_Name"
+			except Exception:
+				name = f"ID:{user_id}"
+			result.append((user_id, efficiency_score, name))
+
+	if not result:
+		await message.answer(f"Нет данных для статистики за `{period}`. Возможно, в этот период не было активности.")
+		return
+
+	# --- 5. Логика вывода (остается без изменений) ---
+	if output_type == 't':
+		MAX_LEN, MAX_PLACE_LEN, MAX_SCORE_LEN = 30, 2, 6
+		MAX_DISPLAY_NAME_LEN = MAX_LEN - MAX_PLACE_LEN - 1 - MAX_SCORE_LEN - 1
+		table_text = f"<b>{title}</b>\n<pre>\n"
+
+		for i, (uid, score, name) in enumerate(result):
+			place = "🥇🥈🥉"[i] if i < 3 else str(i + 1).ljust(MAX_PLACE_LEN)
+			display_name = (name[:MAX_DISPLAY_NAME_LEN - 2] + "..") if len(name) > MAX_DISPLAY_NAME_LEN else name.ljust(MAX_DISPLAY_NAME_LEN)
+			score_str = f"{score:.2f}" if stat_type == 'e' else humanize_value_for_chars(score)
+			display_score = score_str.ljust(MAX_SCORE_LEN)
+			table_text += f"{place} {display_name} {display_score}\n"
+		
+		table_text += "</pre>"
 		await message.answer(table_text, parse_mode='HTML')
-
-	else: # output_type == "image"
-		"""Отправляет изображение топа в чат."""
+	else: # output_type == 'p'
 		image_data = await generate_pil_image(result, title)
 		photo = BufferedInputFile(image_data.getvalue(), filename="top.png")
-		await bot.send_photo(chat_id, photo=photo)
+		await bot.send_photo(chat_id, photo=photo, caption=title)
+		
 	
 def humanize_value_for_chars(num: int) -> str: # Переименовано
 	"""Преобразует количество символов в человекочитаемый формат."""
@@ -783,16 +896,62 @@ def humanize_value_for_chars(num: int) -> str: # Переименовано
 	else:
 		return str(num)
 
-############# Проверка на бота по Картинке ##########
+############# Вход и выход из чата ##########
+async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
+	try:
+		response = await gclient.aio.models.generate_content(
+		model="gemini-2.5-flash",
+		contents=f"""
+**Задача:** Сгенерируй ОДНО короткое (до 20 слов) и язвительное сообщение о кике пользователя.
+
+**Действующие лица (плейсхолдеры):**
+*   Кикнутый пользователь: `{{USER}}`
+*   Тот, кто кикнул: `{{KICKER}}`
+
+**Контекст:**
+*   `is_bot`: `{chel}` (true, если кикнул бот; false, если админ)
+
+**Логика:**
+*   Если `is_bot` это `true`, высмей `{{USER}}` перед бездушным ботом `{{KICKER}}`.
+*   Если `is_bot` это `false`, высмей `{{USER}}` которого изгнал админ `{{KICKER}}`.
+
+**ОЧЕНЬ ВАЖНОЕ ПРАВИЛО:**
+Ответ должен быть **только текстом**. Не используй Markdown, символы ```, кавычки или форматирование. Просто чистый текст с плейсхолдерами `{{USER}}` и `{{KICKER}}`.
+""",
+		)
+	
+		generated_text = response.text
+
+		if not generated_text: # Если ИИ вернул пустую строку
+			raise ValueError("Empty response from AI")
+
+		# Шаг 3: Заменяем плейсхолдеры на реальные ссылки
+		# Kogo -> {{USER}}, Kto -> {{KICKER}}
+		final_message = generated_text.replace('{USER}', Kogo).replace('{KICKER}', Kto)
+		return final_message
+	except Exception as e:
+		# Если ИИ не ответил или произошла ошибка, возвращаем стандартное сообщение
+		logging.error(f"AI generation failed: {e}")
+		return f"👋 {Kto} изгнал(а) пользователя {Kogo}."
+
+
 # Выход из чата
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
 async def off_member(event: ChatMemberUpdated):
 	member = event.new_chat_member.user
-	logging.info(f"Выход:\n из чата {event.chat.title} - {member.full_name}")
-	member = event.new_chat_member.user
-	await event.answer(
-		f"👋 Гудбай [{member.full_name}]({member.url})",
-		parse_mode="Markdown")
+	key = f"chat:{event.chat.id}:new_user_join"
+	logging.info(f"Выход:\n из чата {event.chat.title} - {member.full_name}\n {event.new_chat_member}")
+	await r.hdel(key, member.id)
+	if isinstance(event.new_chat_member, ChatMemberBanned):
+		kick_m = f"[{member.full_name}]({member.url})"
+		adm_kick = f"[{event.from_user.full_name}](t.me/{event.from_user.username})"
+		await event.answer(await kick_msg(adm_kick, kick_m, event.from_user.is_bot),
+			parse_mode="Markdown", 
+			disable_web_page_preview=True)
+	elif isinstance(event.new_chat_member, ChatMemberRestricted):
+		await event.answer(
+			f"👋 Гудбай [{member.full_name}]({member.url})",
+			parse_mode="Markdown")
 
 # Обработчик новых участников
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
@@ -820,7 +979,8 @@ async def new_member(event: ChatMemberUpdated):
 			json.dumps({
 				"message_id": visit_message.message_id,
 				"full_name": new_member.full_name,
-				"join_time": int(time.time())
+				"join_time": int(time.time()),
+				"notified": False
 			})
 		)
 	else:
@@ -833,19 +993,17 @@ async def new_member(event: ChatMemberUpdated):
 			parse_mode="Markdown"
 			)
 
-async def generate_image_description(image_bytes: bytes) -> str:
+async def generate_image_description(image: Image.Image) -> str:
 	try:
-	# Подготавливаем данные изображения для API
-		image_part = {
-			"mime_type": "image/jpeg", # Предполагаем JPEG для фото из Telegram
-			"data": image_bytes
-		}
 		# Формируем запрос (можно кастомизировать)
-		prompt = "Определи есть ли на картинке велосипед и отвть булевым значением True/False"
-		contents = [prompt, image_part]
+		prompt = "Определи есть ли на картинке велосипед и отвть булевым значением True/False"		
 
 		# Генерируем контент асинхронно
-		response = await model.generate_content_async(contents=contents)
+		response = await gclient.aio.models.generate_content(
+			model="gemini-2.5-flash",
+			contents=[image, prompt]
+		)
+
 		return eval(response.text) or "Не удалось получить описание. Попробуйте другую картинку"
 
 	except Exception as e:
@@ -884,23 +1042,37 @@ async def user_lock_unlock(user_id: int, chat_id: int, **kwargs):
 
 # Функция проверки и исключения
 async def check_new_members():
-	TIME_BAN=60*60*24 # 24 часа
-	# Сканируем все ключи в Redis
+	TIME_BAN = 60 * 60 * 24  # 24 часа
+	NOTIFY_HOURS = 1         # Уведомление через 1 час
+
 	async for key in r.scan_iter("chat:*:new_user_join"):
-		# Извлекаем chat_id из ключа (ключ имеет вид chat:<chat_id>:new_user_join)
 		chat_id = key.split(":")[1]
-		# Получаем все поля и значения для данного чата
 		members = await r.hgetall(key)
 		for user_id, data in members.items():
-			# Данные уже строка, так как decode_responses=True
 			data = json.loads(data)
 			join_time = data["join_time"]
 			current_time = int(time.time())
-			if current_time - join_time > TIME_BAN:
+			time_elapsed = current_time - join_time
+			hours_elapsed = time_elapsed // 3600  # Полные часы
+
+			if hours_elapsed == NOTIFY_HOURS and not data.get('notified', False):
+				user_nm = data.get('full_name')
+				msg_id = data.get('message_id')
+				chat_id_str = str(chat_id)[4:]  # Убираем префикс, если есть
 				try:
-					# Исключаем пользователя
+					await bot.send_message(
+						chat_id=int(chat_id),
+						text=f"Часики тикают!\n[{user_nm}](tg://user?id={user_id}) у тебя осталось меньше 23 часов, чтобы ответить на [запрос бота](t.me/c/{chat_id_str}/{msg_id})!",
+						parse_mode="Markdown"
+					)
+					data['notified'] = True
+					await r.hset(key, user_id, json.dumps(data))
+				except Exception as e:
+					logging.error(f"Ошибка при отправке уведомления {user_id} в чат {chat_id}: {e}")
+
+			if time_elapsed > TIME_BAN:
+				try:
 					await bot.ban_chat_member(chat_id=int(chat_id), user_id=int(user_id), until_date=current_time + TIME_BAN)
-					# Удаляем данные из Redis
 					await r.hdel(key, user_id)
 				except Exception as e:
 					logging.error(f"Ошибка при исключении {user_id} из чата {chat_id}: {e}")
@@ -919,9 +1091,9 @@ async def cmd_info(message: Message):
 def escape_markdown_v2(name: str) -> str:
 	"""Экранирует специальные символы MarkdownV2 в тексте."""
 	# Для простоты, сначала можно экранировать все символы, которые имеют значение в MarkdownV2.
-    # Если вы не используете эти символы для форматирования внутри FNAME, то экранирование их будет безопасным.
-    # pattern = r"([_*\[\]()~`>#+\-=|{}.!])"
-    # return re.sub(pattern, r"\\\1", text)
+	# Если вы не используете эти символы для форматирования внутри FNAME, то экранирование их будет безопасным.
+	# pattern = r"([_*\[\]()~`>#+\-=|{}.!])"
+	# return re.sub(pattern, r"\\\1", text)
 	chars_to_escape = '_*[]()~`>#+-=|{}.!' # Включаем все, что может быть проблемой
 	escaped_text = "".join(['\\' + char if char in chars_to_escape else char for char in name])
 	return escaped_text
@@ -953,9 +1125,10 @@ async def save_group_message(message: Message):
 				if new_join:
 					if message.from_user.id == int(user_id):				
 						try:
-							file = await bot.get_file(message.photo[1].file_id)
+							file = await bot.get_file(message.photo[1].file_id)							
 							image_bytes = (await bot.download_file(file.file_path)).read()
-							description = await generate_image_description(image_bytes)
+							image = Image.open(BytesIO(image_bytes))
+							description = await generate_image_description(image)
 							# await message.answer(f"otvet - {description}")
 							if description==True:
 								await user_lock_unlock(user_id, message.chat.id, st="unlock")
@@ -966,11 +1139,11 @@ async def save_group_message(message: Message):
 									hell_msg = await r.get(f"chat:{chat.id}:Hello_msg")
 									hell_msg = hell_msg.replace('FNAME', FNAME)
 								except:
-									hell_msg = f"Поприветствуйте {FNAME}, нового участника\! 👋\n"
+									hell_msg = f"Поприветствуйте {FNAME}, нового участника\\! 👋\n"
 								await message.answer(hell_msg,
-                                                     parse_mode=ParseMode.MARKDOWN_V2,
-                                                     disable_web_page_preview=True
-                                                    )
+													 parse_mode=ParseMode.MARKDOWN_V2,
+													 disable_web_page_preview=True
+													)
 								await r.hdel(key_u_j, user_id)
 							else:
 								answ = "Не удалось найти велосипед 😢" if description else description
@@ -984,12 +1157,16 @@ async def save_group_message(message: Message):
 							await user_lock_unlock(user_id, message.chat.id, st="unlock")
 							user_obj = await bot.get_chat(chat_id=user_id)
 							FNAME=user_obj.full_name or "No_Name"
+							FNAME = escape_markdown_v2(FNAME)
 							try:
 								hell_msg = await r.get(f"chat:{chat.id}:Hello_msg")
 								hell_msg = hell_msg.replace('FNAME', FNAME)
 							except:
-								hell_msg = f"Поприветствуйте {FNAME}, нового участника! 👋\n"
-							await message.answer(hell_msg)
+								hell_msg = f"Поприветствуйте {FNAME}, нового участника\\! 👋\n"
+							await message.answer(hell_msg,
+													 parse_mode=ParseMode.MARKDOWN_V2,
+													 disable_web_page_preview=True
+													)
 							await r.hdel(key_u_j, user_id)
 						elif message.text == "Бан!":
 							await bot.ban_chat_member(chat.id, user_id)
@@ -1032,20 +1209,39 @@ async def save_group_message(message: Message):
 		return
 	
 	# Обновляем счетчики в Redis
-	await r.zincrby(f"chat:{chat.id}:count_u_msg", 1, user.id)
-	await r.zincrby(f"chat:{chat.id}:count_u_len", len(message_data['text']), user.id)
-	if bayan: await r.zincrby(f"chat:{chat.id}:count_u_byn", 1, user.id)
-			
-# save in db
-	try:
-		async with r.pipeline() as pipe:
-			await pipe.lpush(key, json.dumps(message_data))
-			await pipe.ltrim(key, 0, MAX_HISTORY - 1)
-			await pipe.execute()
+	# Получаем текущий месяц в формате YYYY-MM
+	current_period = datetime.now().strftime("%Y-%m")
 	
-		logging.info(f"Message {message.message_id} saved successfully in {chat_nm}")
-	except Exception as e:
-		logging.error(f"Error saving message: {e}", exc_info=True)
+	# Ключи для статистики
+	# Общие
+	key_msg_all = f"chat:{chat.id}:count_u_msg:all_time"
+	key_len_all = f"chat:{chat.id}:count_u_len:all_time"
+	key_byn_all = f"chat:{chat.id}:count_u_byn:all_time"
+	# За текущий месяц
+	key_msg_month = f"chat:{chat.id}:count_u_msg:{current_period}"
+	key_len_month = f"chat:{chat.id}:count_u_len:{current_period}"
+	key_byn_month = f"chat:{chat.id}:count_u_byn:{current_period}"
+
+	async with r.pipeline() as pipe:
+		# Обновляем общую статистику
+		pipe.zincrby(key_msg_all, 1, user.id)
+		pipe.zincrby(key_len_all, len(message_data['text']), user.id)
+		if bayan:
+			pipe.zincrby(key_byn_all, 1, user.id)
+
+		# Обновляем статистику за текущий месяц
+		pipe.zincrby(key_msg_month, 1, user.id)
+		pipe.zincrby(key_len_month, len(message_data['text']), user.id)
+		if bayan:
+			pipe.zincrby(key_byn_month, 1, user.id)
+		
+		# Сохранение сообщения в историю
+		pipe.lpush(f"chat:{chat.id}:history", json.dumps(message_data))
+		pipe.ltrim(f"chat:{chat.id}:history", 0, MAX_HISTORY - 1)
+		
+		await pipe.execute()
+
+	logging.info(f"Message {message.message_id} saved and stats updated for period {current_period} in {chat_nm}")
 
 # Настройка планировщика
 def setup_scheduler():
@@ -1057,7 +1253,7 @@ def setup_scheduler():
 # Запуск бота
 async def main():
 	print("✅ Бот запущен!")
-	# setup_scheduler() # Настройка планировщика
+	setup_scheduler() # Настройка планировщика
 	await init_redis()
 	await dp.start_polling(bot)
 
