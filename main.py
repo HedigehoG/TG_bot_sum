@@ -9,7 +9,6 @@ import uuid
 import re
 from datetime import datetime, timedelta
 import time
-
 from annotated_types import LowerCase
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -51,7 +50,7 @@ GOOGLE_API_KEY = getenv("GOOGLE_API_KEY")
 gclient = genai.Client(api_key=GOOGLE_API_KEY)
 
 #RAPIDAPI_KEY = getenv("RAPIDAPI_KEY")
-REDIS_HOST = getenv("REDIS_HOST", "localhost")
+REDIS_HOST = getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(getenv("REDIS_PORT", 6379))
 
 
@@ -77,6 +76,7 @@ NOTIFY_AFTER_MINUTES = 10  # Через сколько минут напомин
 NOTIFY_AFTER_SECONDS = NOTIFY_AFTER_MINUTES * 60
 CLEANUP_AFTER_MINUTES = 10  # Через сколько минут удалять сообщения проверки
 CLEANUP_AFTER_SECONDS = CLEANUP_AFTER_MINUTES * 60
+EDIT_SEARCH_DEPTH = 200 # Глубина поиска в истории для обновления отредактированных сообщений
 
 # Инициализация 
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -97,10 +97,28 @@ async def init_redis():
 		logging.error(f"Failed to connect to Redis: {e}")
 		# Здесь можно предусмотреть повторные попытки подключения или другие действия
 
-async def get_admins(chat_id: int):
-	# Подгрузка списка админов
-	admins = await bot.get_chat_administrators(chat_id)
-	admin_ids = {admin.user.id for admin in admins}
+async def get_admins(chat_id: int, force_refresh: bool = False) -> set:
+	"""
+	Возвращает множество ID администраторов чата.
+	Результат кешируется в Redis на 60 секунд для уменьшения нагрузки на API.
+	"""
+	cache_key = f"chat:{chat_id}:admins_cache"
+	
+	if not force_refresh:
+		cached_admins = await r.smembers(cache_key)
+		if cached_admins:
+			logging.debug(f"Admins for chat {chat_id} loaded from cache.")
+			return {int(admin_id) for admin_id in cached_admins}
+
+	# Если в кеше нет или нужен форс-рефреш
+	logging.debug(f"Fetching admins for chat {chat_id} from Telegram API.")
+	admins_list = await bot.get_chat_administrators(chat_id)
+	admin_ids = {admin.user.id for admin in admins_list}
+	
+	# Сохраняем в кеш
+	if admin_ids:
+		await r.sadd(cache_key, *[str(id) for id in admin_ids])
+		await r.expire(cache_key, 60) # Кеш на 60 секунд
 	return admin_ids
 
 # Конвертер секунд
@@ -231,8 +249,7 @@ async def summarize(message: Message, command: CommandObject): # <-- Измен�
 
 	# Проверка на доступ у чата и юзера
 	# req = await is_user_approved(chat_id, user_id)
-	req = 'on' # Для тестов, чтобы не проверять в бд
-
+	req = 'on'
 	if req == 'on':
 		# 1. Проверяем, занят ли чат
 		if chat_id in LOCK_FOR_SUMMARIZE:
@@ -274,6 +291,11 @@ async def summarize(message: Message, command: CommandObject): # <-- Измен�
 				logging.info(f"Снятие блокировки для чата {chat_id}. Активные блокировки: {LOCK_FOR_SUMMARIZE}")
 
 	elif req == 'off':
+		if not ADMIN_ID:
+			logging.error("ADMIN_ID не установлен в .env, не могу отправить запрос на одобрение.")
+			await message.reply("Функция требует настройки администратором бота.")
+			return
+
 		request_id = await create_approval_request(user_id, chat_id, chat_Ti, user_nm)
 		keyboard = InlineKeyboardMarkup(inline_keyboard=[
 			[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{request_id}:{chat_id}")],
@@ -281,7 +303,7 @@ async def summarize(message: Message, command: CommandObject): # <-- Измен�
 		])
 
 		await bot.send_message(
-			ADMIN_ID,
+			int(ADMIN_ID),
 			f"⚠️ Новый запрос на доступ:\n"
 			f"User: {message.from_user.full_name} (@{user_nm})\n"
 			f"Группа: {chat_Ti}\n"
@@ -322,6 +344,42 @@ def auto_gpt_mes_count(value):
 		# Нелинейная интерполяция для более быстрого роста при малых значениях
 		return int(500 + (value - 100) * (3700 - 500) / (2000 - 100) * (0.8 * (1 - (value - 100) / 500) ** 2 + 0.2))
 
+async def _fetch_messages_for_summary(chat_id: int, count: int, start: int) -> tuple[list, int, str | None]:
+	"""
+	Извлекает сообщения из Redis для суммаризации.
+	Возвращает (список сообщений, количество, ID последнего сообщения для ссылки).
+	"""
+	key = f"chat:{chat_id}:history"
+	last_sum_id = None
+	
+	if count > 0:
+		# Пользовательский запрос с указанием количества
+		logging.info(f'Запрос на сводку {count} сообщений со смещением {start}')
+		messages_json = await r.lrange(key, start, start + count - 1)
+		messages = [json.loads(m) for m in messages_json]
+		messages.reverse()
+	else:
+		# Автоматический запрос (новые сообщения с последней сводки)
+		last_sum_data = await r.hgetall(f"chat:{chat_id}:last_sum")
+		msg_old_id = int(last_sum_data.get('id', 0))
+		last_sum_id = last_sum_data.get('msg_id')
+
+		# Если последней сводки не было, берем DEF_SUM_MES
+		if msg_old_id == 0:
+			messages_json = await r.lrange(key, 0, DEF_SUM_MES - 1)
+			messages = [json.loads(m) for m in messages_json]
+			messages.reverse()
+		else:
+			messages = []
+			history_chunk = await r.lrange(key, 0, MAX_TO_GPT) 
+			for msg_json in history_chunk:
+				msg = json.loads(msg_json)
+				if msg['id'] > msg_old_id:
+					messages.append(msg)
+				else:
+					break # Нашли границу, прекращаем
+			messages.reverse() # Восстанавливаем хронологический порядок
+	return messages, len(messages), last_sum_id
 
 # Делаем суммаризацию
 async def process_summarize(message: Message, count=0, start=0, privat: bool = False):
@@ -335,70 +393,20 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 	else:
 		target_chat_id = chat.id
 	
-	new_messages = []
-	msg_old_id = None	
-
-	ttl = await check_daily_limit(chat_id, user.username)
+	ttl = await check_daily_limit(chat_id, user.id)
 	if (ttl > 0):
 		await del_msg_delay(await message.answer(f"❌ Достигнут лимит запросов суммаризации!\n Подождите {format_seconds(ttl)}"))
 		return
 	
-	try:
-		key = f"chat:{chat_id}:history"
-		logging.info(f"Проверка получения последнего сообщения из: {key}")
-		messages = await r.lrange(key, 0, 0)
-		msg_last = json.loads(messages[0])
-		msg_last_id = msg_last['id']
-	except Exception as e:
-		logging.error(f"Redis history error: {e}")
-		await message.answer("Ошибка получения истории чата")
-		return
-	
-	chat_id_str = str(chat_id)[4:]  ## обрезка индекса для ссылки на чат
-	chat = message.chat
-	if chat.username:
-		turl = f"t.me/{chat.username}/"
-	else:
-		turl = f"t.me/c/{chat_id_str}/"
-
-	if count != 0:
-		logging.info(f'свой свод c-{count} s-{start}')
-		messages = await r.lrange(key, start, start + count - 1)
-		messages = [json.loads(message_json) for message_json in messages]
-		messages.reverse()
-
-	else:
-		msg_old_id = await r.hget(f"chat:{chat_id}:last_sum", 'id')
-		last_sum_id = await r.hget(f"chat:{chat_id}:last_sum", 'msg_id')
-
-		# Преобразуем значения в целые числа, обрабатывая None
-		msg_old_id = int(msg_old_id or 0)  # Если None, используем 0
-		msg_last_id = int(msg_last_id or 0) # Если None, используем 0
-
-		count = msg_last_id - msg_old_id
-
-		#logging.info(f"chat:{chat_id}:last_sum",count , msg_last_id, msg_old_id)
-		if count < MIN_TO_GPT:
-			await del_msg_delay(await message.answer(f"Новых сообщений не более {count}, прочитайте сами."))
-			return
-
-		messages = await r.lrange(key, 0, count - 1)
-
-		for message_json in messages:
-			msg = json.loads(message_json)            
-			if msg['id'] > msg_old_id:
-				new_messages = [msg] + new_messages
-			else:
-				break
-
-		messages = new_messages
-		count = len(new_messages)
+	messages, final_count, last_sum_id = await _fetch_messages_for_summary(chat_id, count, start)
 
 	if not messages:
 		await del_msg_delay(await message.answer("Нет сообщений для суммаризации."))
 		return
 
-	if new_messages and (last_sum_id != 0): 
+	chat_id_str = str(chat_id)[4:]
+	turl = f"t.me/{chat.username}/" if chat.username else f"t.me/c/{chat_id_str}/"
+	if last_sum_id: 
 		surl = f'Предыдущий свод [тут]({turl}{last_sum_id})'
 	else:
 		surl = ''
@@ -414,17 +422,22 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 
 		typing_task = asyncio.create_task(send_typing_periodically())
 
-		logging.info(f"передача 1msg-{messages[0]}\n"
-					f"число-{count}, last_sum_id-{surl}, msg_old_id-{msg_old_id}")
+		logging.info(f"Передача {final_count} сообщений в AI для чата {chat_id}")
 		summary = await get_gpt4_summary(messages, turl)
+
+		if not summary:
+			logging.error("AI returned an empty or None summary, cannot proceed.")
+			await bot.send_message(target_chat_id, "Не удалось сгенерировать сводку. Попробуйте позже.")
+			return # Выходим, finally выполнится
+
 		logging.info(f"Ответ gpt4: получен. Длина {len(summary)}")
 		await r.lpush('gpt_answ_t', json.dumps(summary))
 
 		if typing_task:
 			typing_task.cancel()
-
+		
 		# <--- 4. Используем bot.send_message для отправки в target_chat_id
-		sum_text = f"📝 #Суммаризация последних {count} сообщений:\n{summary}"
+		sum_text = f"📝 #Суммаризация последних {final_count} сообщений:\n{summary}"
 		if surl and not privat: # Добавляем ссылку на пред. свод только если постим в чат
 			sum_text += f"\n{surl}"
 
@@ -448,15 +461,16 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 		if typing_task:
 			typing_task.cancel()
 
-	await upd_daily_limit(chat_id, user.username, privat)
+	await upd_daily_limit(chat_id, user.id, privat)
 	
-	if new_messages and not privat:
+	# Обновляем last_sum только если это не приватный запрос и не кастомный по числу
+	if not privat and count == 0:
 		key = f"chat:{chat_id}:last_sum"
 		async with r.pipeline() as pipe:
-			pipe.hset(key, 'id', msg_last_id)
+			pipe.hset(key, 'id', messages[-1]['id']) # ID последнего обработанного сообщения
 			pipe.hset(key, 'msg_id', sum.message_id)
 			pipe.hset(key, 'text', json.dumps(summary))
-			pipe.lpush(key+":all",json.dumps([msg_last_id,sum.message_id,messages,summary]))
+			pipe.lpush(key+":all",json.dumps([messages[-1]['id'],sum.message_id,messages,summary]))
 			pipe.ltrim(key+":all", 0, 10 - 1)
 			await pipe.execute()	
 
@@ -487,7 +501,7 @@ async def check_daily_limit(chat_id: int, user_id: int) -> int:
 
 	async with r.pipeline() as pipe:
 		# Получаем оставшееся время жизни для пользователя и группы через HTTL
-		pipe.httl(key, user_id)
+		pipe.httl(key, str(user_id))
 		pipe.httl(key, "group")
 		results = await pipe.execute()
 
@@ -503,8 +517,8 @@ async def upd_daily_limit(chat_id: int, user_id: int, privat:bool):
 
 	async with r.pipeline() as pipe:
 		# Увеличиваем значения лимитов и задаем TTL для каждого поля
-		pipe.hincrby(key, user_id)
-		pipe.hexpire(key, 86400 // SEND_MES, user_id)  # TTL для пользователя (24 часа)
+		pipe.hincrby(key, str(user_id))
+		pipe.hexpire(key, 86400 // SEND_MES, str(user_id))  # TTL для пользователя (24 часа)
 		
 		if not privat:
 			pipe.hincrby(key, group_field)
@@ -514,7 +528,7 @@ async def upd_daily_limit(chat_id: int, user_id: int, privat:bool):
 
 
 # Запрос к ИИ
-async def get_gpt4_summary(text: list, turl: str) -> str:
+async def get_gpt4_summary(text: list, turl: str) -> str | None:
 	#return f"Jlsdgssdgdfhdh\n"	
 	# MAX_SUM = auto_gpt_mes_count(count)
 
@@ -607,12 +621,38 @@ async def get_gpt4_summary(text: list, turl: str) -> str:
 				),
 			contents=json.dumps(text),  # Описание, текст в формате JSON
 			)
-		return response.text #.rsplit('--- cut here ---', 1)  # Возвращаем текст после "отрезки"
+		
+		# Сохраняем успешный ответ для отладки
+		try:
+			debug_info = {
+				"timestamp": datetime.now().isoformat(),
+				"status": "success",
+				"input_messages_count": len(text),
+				"response_text": response.text,
+				"prompt_feedback": str(response.prompt_feedback) if response.prompt_feedback else "N/A",
+			}
+			await r.lpush("For_debag", json.dumps(debug_info, ensure_ascii=False))
+			await r.ltrim("For_debag", 0, 49) # Храним последние 50 записей
+		except Exception as redis_e:
+			logging.error(f"Не удалось записать отладочную информацию в Redis: {redis_e}")
+
+		return response.text
 
 	except Exception as e:
 		logging.error(f"Произошла ошибка при обращении к Gemini: {e}", exc_info=True)
-		# return f"Ошибка при генерации сводки: {e}"
-			
+		# Сохраняем информацию об ошибке для отладки
+		try:
+			error_info = {
+				"timestamp": datetime.now().isoformat(),
+				"status": "error",
+				"error_message": str(e),
+				"input_messages_count": len(text),
+			}
+			await r.lpush("For_debag", json.dumps(error_info, ensure_ascii=False))
+			await r.ltrim("For_debag", 0, 10)
+		except Exception as redis_e:
+			logging.error(f"Не удалось записать отладочную информацию об ошибке в Redis: {redis_e}")
+		return None
 
 # Обработка подтверждения/отказа запроса
 @dp.callback_query(F.data.startswith("approve:") | F.data.startswith("reject:"))
@@ -994,39 +1034,46 @@ async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 		return f"👋 {Kto} изгнал(а) пользователя {Kogo}."
 
 
-# Функция для прогрессивной блокировки
-async def get_progressive_ban_duration(chat_id: int, user_id: int) -> (int, str):
+# Функция для применения прогрессивной блокировки
+async def apply_progressive_ban(chat_id: int, user_id: int, reason_log: str):
 	"""
-	Вычисляет длительность прогрессивной блокировки для пользователя.
-	Увеличивает счетчик банов и возвращает кортеж с:
-	1. Временной меткой Unix для окончания бана.
-	2. Строкой с описанием срока блокировки.
+	Вычисляет длительность прогрессивной блокировки, применяет её к пользователю и логирует действие.
 	"""
-	key = f"chat:{chat_id}:ban_counter:{user_id}"
-	
-	# Увеличиваем счетчик банов для пользователя
-	ban_count = await r.incr(key)
-	
-	# Устанавливаем TTL на 1 год при первом нарушении, чтобы счетчик сбрасывался
-	if ban_count == 1:
-		await r.expire(key, int(timedelta(days=366).total_seconds()))
-
-	now = datetime.now()
-	
-	if ban_count == 1:
-		# 1-е нарушение: бан на 1 день
-		ban_until = now + timedelta(days=1)
-		duration_str = "1 день"
-	elif ban_count == 2:
-		# 2-е нарушение: бан на 1 месяц (30 дней)
-		ban_until = now + timedelta(days=30)
-		duration_str = "1 месяц"
-	else:
-		# 3-е и последующие нарушения: бан на 1 год
-		ban_until = now + timedelta(days=365)
-		duration_str = "1 год"
+	try:
+		key = f"chat:{chat_id}:ban_counter:{user_id}"
 		
-	return int(ban_until.timestamp()), duration_str
+		# Увеличиваем счетчик банов для пользователя
+		ban_count = await r.incr(key)
+		
+		# Устанавливаем TTL на 1 год при первом нарушении, чтобы счетчик сбрасывался
+		if ban_count == 1:
+			await r.expire(key, int(timedelta(days=366).total_seconds()))
+
+		now = datetime.now()
+		
+		if ban_count == 1:
+			# 1-е нарушение: бан на 1 день
+			ban_until = now + timedelta(days=1)
+			duration_str = "1 день"
+		elif ban_count == 2:
+			# 2-е нарушение: бан на 1 месяц (30 дней)
+			ban_until = now + timedelta(days=30)
+			duration_str = "1 месяц"
+		else:
+			# 3-е и последующие нарушения: бан на 1 год
+			ban_until = now + timedelta(days=365)
+			duration_str = "1 год"
+			
+		ban_until_timestamp = int(ban_until.timestamp())
+
+		await bot.ban_chat_member(
+			chat_id=chat_id,
+			user_id=user_id,
+			until_date=ban_until_timestamp
+		)
+		logging.warning(f"Пользователь {user_id} забанен на {duration_str} в чате {chat_id}. Причина: {reason_log}")
+	except Exception as e:
+		logging.error(f"Не удалось забанить пользователя {user_id} в чате {chat_id}: {e}")
 
 # Выход из чата
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
@@ -1104,19 +1151,10 @@ async def new_member(event: ChatMemberUpdated):
 				await countdown_msg.edit_text(next_message, parse_mode="HTML")
 				# Проверяем статус пользователя на каждом шаге
 				member_status = await bot.get_chat_member(chat_id, user_id)
-				if member_status.status not in ["member", "restricted"]:
+				if member_status.status not in ["member", "restricted"]:					
 					await countdown_msg.delete()
-					# --- НОВАЯ ЛОГИКА ПРОГРЕССИВНОГО БАНА ---
-					ban_until_timestamp, duration_str = await get_progressive_ban_duration(chat_id, user_id)
-					try:
-						await bot.ban_chat_member(
-							chat_id=chat_id,
-							user_id=user_id,
-							until_date=ban_until_timestamp
-						)
-						logging.warning(f"Пользователь {new_member.full_name} ({user_id}) покинул чат во время отсчета и был забанен на {duration_str}.")
-					except Exception as ban_error:
-						logging.error(f"Не удалось забанить пользователя {user_id}, покинувшего чат во время отсчета: {ban_error}")
+					reason = f"покинул чат во время отсчета ({new_member.full_name})"
+					await apply_progressive_ban(chat_id, user_id, reason)
 					return
 			except Exception as e:
 				logging.error(f"Ошибка при обновлении отсчёта или проверке статуса: {e}")
@@ -1177,9 +1215,7 @@ async def generate_image_description(image: Image.Image) -> str:
 			model="gemini-2.5-flash",
 			contents=[image, prompt]
 		)
-
 		return eval(response.text) or "Не удалось получить описание. Попробуйте другую картинку"
-
 	except Exception as e:
 		logging.error(f"Ошибка в generate_image_description: {e}")
 		# В реальном приложении здесь лучше использовать logging
@@ -1279,15 +1315,10 @@ async def check_new_members():
 			if time_elapsed > TIME_TO_BAN_SECONDS:
 				user_nm = data.get('full_name', f'user_{user_id}')
 				try:
-					# --- НОВАЯ ЛОГИКА ПРОГРЕССИВНОГО БАНА ---
-					ban_until_timestamp, duration_str = await get_progressive_ban_duration(int(chat_id), int(user_id))
-					await bot.ban_chat_member(
-						chat_id=int(chat_id), 
-						user_id=int(user_id), 
-						until_date=ban_until_timestamp
-					)
-					logging.info(f"Пользователь {user_id} - {user_nm} забанен на {duration_str} в чате {chat_id} за провал проверки.")
-					
+					# Применяем прогрессивный бан
+					reason = f"провал проверки ({user_nm})"
+					await apply_progressive_ban(int(chat_id), int(user_id), reason)
+
 					# --- ЯВНАЯ ОТПРАВКА СООБЩЕНИЯ О БАНЕ ---
 					bot_user = await bot.get_me()
 					bot_link = f"[{html.escape(bot_user.full_name)}]({bot_user.url})"
@@ -1331,134 +1362,132 @@ def escape_markdown_v2(name: str) -> str:
 	escaped_text = "".join(['\\' + char if char in chars_to_escape else char for char in name])
 	return escaped_text
 
+
+async def _handle_verification_message(message: Message) -> bool:
+	"""
+	Обрабатывает все сообщения, связанные с верификацией новых пользователей.
+	Возвращает True, если сообщение было обработано, и False в противном случае.
+	"""
+	chat = message.chat
+	chat_id = chat.id
+	user_id = message.from_user.id
+	key_u_j = f"chat:{chat_id}:new_user_join"
+
+	# --- БЛОК 1: Обработка сообщений от пользователей, проходящих верификацию ---
+	is_user_under_verification = await r.hexists(key_u_j, user_id)
+
+	if is_user_under_verification:
+		# ПРАВИЛО 1: Пересланное фото от нового юзера -> немедленный бан.
+		if message.photo and (message.forward_from or message.forward_from_chat):
+			await message.delete()
+			await apply_progressive_ban(chat_id, user_id, "пересланное фото от нового пользователя")
+			await cleanup_verification_data(chat_id, user_id)
+			# await message.answer('Вы были забанены за пересланное фото. Новым пользователям запрещено отправлять пересланные фото.')
+			return True
+
+		# ПРАВИЛО 2: Пользователь ответил на сообщение-проверку.
+		if message.reply_to_message and message.reply_to_message.from_user.is_bot:
+			pattern = r'tg://user\?id=(\d+)'
+			match = re.search(pattern, message.reply_to_message.md_text)
+			# Убедимся, что он отвечает на СВОЮ проверку
+			if match and int(match.group(1)) == user_id:
+				if message.photo:
+					# Это правильный сценарий, обрабатываем фото.
+					try:
+						file = await bot.get_file(message.photo[1].file_id)
+						image_bytes = (await bot.download_file(file.file_path)).read()
+						image = Image.open(BytesIO(image_bytes))
+						description = await generate_image_description(image)
+
+						if description is True:
+							member_status = await bot.get_chat_member(chat_id, user_id)
+							if member_status.status not in ("left", "kicked", "banned"):
+								await user_lock_unlock(user_id, chat_id, st="unlock")
+								user_obj = await bot.get_chat(chat_id=user_id)
+								FNAME = escape_markdown_v2(user_obj.full_name or "No_Name")
+								hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте FNAME, нового участника\\! 👋\n").replace('FNAME', FNAME)
+								await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+								await cleanup_verification_data(chat_id, user_id)
+							else:
+								logging.warning(f"Пользователь {user_id} покинул чат до завершения проверки.")
+								await cleanup_verification_data(chat_id, user_id)
+						else:
+							answ = "Не удалось найти велосипед 😢" if not description else str(description)
+							await message.reply(answ)
+							await bot.delete_message(chat_id, message.message_id)
+					except Exception as e:
+						logging.error(f"Ошибка при обработке фото для верификации: {e}", exc_info=True)
+						await message.reply(f"Не удалось обработать фото. Попробуйте еще раз.\n{e}")
+				return True
+
+		# ПРАВИЛО 3: Любое другое сообщение от пользователя на верификации -> удаление и напоминание.
+		if message.photo:
+			await message.delete()
+			await message.answer('Пожалуйста, отправьте фото в ответ на сообщение бота.')
+		return True
+
+	# --- БЛОК 2: Обработка ответов от админов на сообщения о верификации ---
+	if message.reply_to_message and message.reply_to_message.from_user.is_bot:
+		pattern = r'tg://user\?id=(\d+)'
+		match = re.search(pattern, message.reply_to_message.md_text)
+		if match:
+			verified_user_id = int(match.group(1))
+			# Проверяем, что админ отвечает на всё ещё активную проверку
+			if await r.hexists(key_u_j, verified_user_id):
+				admins = await get_admins(chat_id)
+				if user_id in admins and message.text:
+					text_lower = message.text.lower()
+					if "принят" in text_lower:
+						await user_lock_unlock(verified_user_id, chat_id, st="unlock")
+						user_obj = await bot.get_chat(chat_id=verified_user_id)
+						FNAME = escape_markdown_v2(user_obj.full_name or "No_Name")
+						hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте FNAME, нового участника\\! 👋\n").replace('FNAME', FNAME)
+						await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+						await cleanup_verification_data(chat_id, verified_user_id)
+					elif "бан" in text_lower:
+						reason = f"команда 'бан' от администратора {message.from_user.full_name}"
+						await apply_progressive_ban(chat_id, verified_user_id, reason)
+						banned_user_obj = await bot.get_chat(verified_user_id)
+						banned_user_link = f"[{html.escape(banned_user_obj.full_name)}]({banned_user_obj.url})"
+						admin_user_link = f"[{html.escape(message.from_user.full_name)}]({message.from_user.url})"
+						kick_message_text = await kick_msg(admin_user_link, banned_user_link, False)
+						ban_msg = await bot.send_message(chat_id, kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
+						asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
+						await message.delete()
+						await cleanup_verification_data(chat_id, verified_user_id)
+					else:
+						await del_msg_delay(await message.reply("Можно только 'Принят!' или 'Бан!'."))
+					return True
+			else:
+				# Админ (или пользователь) отвечает на уже завершенную проверку
+				await del_msg_delay(await message.reply("Уже всё, поздно 😏"))
+				return True
+
+	return False # Это обычное сообщение, не связанное с верификацией
+
 # Слушать сообщения чата
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), ~F.text.startswith('/')) # Игнорируем команды
 async def save_group_message(message: Message):
-	logging.info(f"Processing message in chat {message.chat.id}")  # Добавляем логирование
+	# --- 1. Обработка верификации и спама от новых пользователей ---
+	if await _handle_verification_message(message):
+		return # Если сообщение было частью верификации, прекращаем обработку
+
+	# --- 2. Обработка обычных сообщений ---
+	logging.info(f"Processing regular message in chat {message.chat.id}")
 	user = message.from_user
 	chat = message.chat
 	chat_nm = chat.title
 	user_name = user.username or "None"
-	full_name = user.full_name or "БезыНя-шка"	
-
-	key = f"chat:{chat.id}:history"
+	full_name = user.full_name or "БезыНя-шка"
 	message_data = {}
-	mtext=''
-	
-	# Проверяем, является ли сообщение ответом на другое сообщение
-	if message.reply_to_message and (message.photo or message.text):
-		if message.reply_to_message.from_user.is_bot:
-			pattern = r'tg://user\?id=(\d+)'
-			match = re.search(pattern, message.reply_to_message.md_text)
-			if match:
-				user_id = match.group(1)
-				admins = await get_admins(chat.id)
-				key_u_j = f"chat:{chat.id}:new_user_join"
-				new_join = await r.hget(key_u_j, user_id)
-				if new_join:
-					if message.from_user.id == int(user_id):
-						try:
-							file = await bot.get_file(message.photo[1].file_id)                            
-							image_bytes = (await bot.download_file(file.file_path)).read()
-							image = Image.open(BytesIO(image_bytes))
-							description = await generate_image_description(image)
-							
-							if description is True:
-								# --- РЕШЕНИЕ RACE CONDITION ---
-								# Перед отправкой приветствия проверим, не ушел ли пользователь
-								try:
-									member_status = await bot.get_chat_member(message.chat.id, int(user_id))
-									if member_status.status in ("left", "kicked", "banned"):
-										logging.warning(f"Пользователь {user_id} покинул чат до завершения проверки. Отменяем приветствие.")
-										await cleanup_verification_data(message.chat.id, int(user_id))
-										return # Прерываем выполнение
-								except Exception:
-									logging.warning(f"Не удалось проверить статус {user_id}. Вероятно, он покинул чат. Отменяем приветствие.")
-									await cleanup_verification_data(message.chat.id, int(user_id))
-									return # Прерываем выполнение
-
-								await user_lock_unlock(user_id, message.chat.id, st="unlock")
-								user_obj = await bot.get_chat(chat_id=user_id)
-								FNAME = user_obj.full_name or "No_Name"
-								FNAME = escape_markdown_v2(FNAME)
-								try:
-									hell_msg = await r.get(f"chat:{chat.id}:Hello_msg")
-									hell_msg = hell_msg.replace('FNAME', FNAME)
-								except:
-									hell_msg = f"Поприветствуйте {FNAME}, нового участника\\! 👋\n"
-								await message.answer(hell_msg,
-													 parse_mode=ParseMode.MARKDOWN_V2,
-													 disable_web_page_preview=True
-													)
-								# Централизованная очистка
-								await cleanup_verification_data(message.chat.id, int(user_id))
-							else:
-								answ = "Не удалось найти велосипед 😢" if description else description
-								await message.reply(answ)
-								# Удаляем фото, если не найден велосипед
-								try:
-									await bot.delete_message(chat.id, message.message_id)
-								except Exception as e:
-									if 'message to delete not found' in str(e).lower():
-										pass
-									else:
-										logging.warning(f"Ошибка при удалении фото: {e}")
-
-						except Exception as e:
-							logging.error(f"Ошибка при скачивании или обработке фото: {e}")
-							await message.reply(f"Не удалось обработать фото. Попробуйте еще раз.\n{e}")
-					elif message.from_user.id in admins:
-						if "принят" in message.text.lower() or "принят!" in message.text.lower():
-							await user_lock_unlock(user_id, message.chat.id, st="unlock")
-							user_obj = await bot.get_chat(chat_id=user_id)
-							FNAME=user_obj.full_name or "No_Name"
-							FNAME = escape_markdown_v2(FNAME)
-							try:
-								hell_msg = await r.get(f"chat:{chat.id}:Hello_msg")
-								hell_msg = hell_msg.replace('FNAME', FNAME)
-							except:
-								hell_msg = f"Поприветствуйте {FNAME}, нового участника\\! 👋\n"
-							await message.answer(hell_msg,
-													 parse_mode=ParseMode.MARKDOWN_V2,
-													 disable_web_page_preview=True
-													)
-							# Централизованная очистка
-							await cleanup_verification_data(message.chat.id, int(user_id))
-						elif "бан" in message.text.lower() or "бан!" in message.text.lower():
-							# 1. Применяем прогрессивный бан
-							ban_until_timestamp, duration_str = await get_progressive_ban_duration(chat.id, int(user_id))
-							await bot.ban_chat_member(
-								chat_id=chat.id, 
-								user_id=int(user_id), 
-								until_date=ban_until_timestamp
-							)
-							logging.info(f"Администратор {message.from_user.full_name} забанил пользователя {user_id} на {duration_str}.")
-
-							# 2. Генерируем и отправляем сообщение-насмешку
-							banned_user_obj = await bot.get_chat(int(user_id))
-							banned_user_link = f"[{html.escape(banned_user_obj.full_name)}]({banned_user_obj.url})"
-							admin_user_link = f"[{html.escape(message.from_user.full_name)}]({message.from_user.url})"
-							
-							kick_message_text = await kick_msg(admin_user_link, banned_user_link, False) # is_bot = False
-							
-							ban_msg = await bot.send_message(chat.id, kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
-							
-							# 3. Запускаем отложенное удаление сообщения о бане (10 минут)
-							asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
-
-							# 4. Удаляем команду админа ("бан") и очищаем данные
-							await message.delete()
-							await cleanup_verification_data(message.chat.id, int(user_id))
-						else:
-							await del_msg_delay(await message.reply("Можно только 'Принят!' или 'Бан!'."))
-				else:
-					await del_msg_delay(await message.reply("Уже всё, поздно 😏"))
+	mtext = ''
 
 	# База баянов
 	bayan = False
 	if message.photo or message.video:
 		bayan = await check_bayan(message)
 
+	# --- 3. Сборка данных для сохранения ---
 	message_data['id'] = message.message_id
 	if message.reply_to_message:  # Добавлена проверка на None
 		message_data['reply_to'] = message.reply_to_message.message_id
@@ -1485,7 +1514,7 @@ async def save_group_message(message: Message):
 	else:
 		return
 	
-	# Обновляем счетчики в Redis
+	# --- 4. Обновление статистики и сохранение в Redis ---
 	# Получаем текущий месяц в формате YYYY-MM
 	current_period = datetime.now().strftime("%Y-%m")
 	
@@ -1520,6 +1549,28 @@ async def save_group_message(message: Message):
 
 	logging.info(f"Message {message.message_id} saved and stats updated for period {current_period} in {chat_nm}")
 
+@dp.edited_message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), ~F.text.startswith('/'))
+async def handle_edited_message(message: Message):
+	"""Обрабатывает отредактированные сообщения и обновляет их в истории Redis."""
+	chat_id, message_id = message.chat.id, message.message_id
+	key = f"chat:{chat_id}:history"
+	logging.info(f"Attempting to update edited message {message_id} in chat {chat_id}")
+
+	history_json = await r.lrange(key, 0, EDIT_SEARCH_DEPTH - 1)
+	for i, msg_json in enumerate(history_json):
+		try:
+			msg_data = json.loads(msg_json)
+			if msg_data.get('id') == message_id:
+				new_text = message.text or message.caption
+				if not new_text: return
+
+				msg_data['text'] = new_text
+				
+				await r.lset(key, i, json.dumps(msg_data))
+				logging.info(f"Message {message_id} updated in history at index {i}.")
+				return
+		except (json.JSONDecodeError, TypeError): continue
+	logging.warning(f"Edited message {message_id} not found in history for update.")
 
 async def set_main_menu(bot: Bot):
 	"""
@@ -1532,6 +1583,7 @@ async def set_main_menu(bot: Bot):
 		BotCommand(command="top_u", description="🏆 Показать топ активных пользователей"),
 		# BotCommand(command="анекдот", description="😂 Рассказать анекдот"),
 		# BotCommand(command="/right", description="🔒 Проверить права (бота или юзера)"),
+		BotCommand(command="del", description="🗑️ (Админ) Удалить сообщение"),
 		BotCommand(command="run_info", description="ℹ️ Время запуска бота"),
 		BotCommand(command="hello_m", description="✍️ (Админ) Установить приветствие")
 	]
