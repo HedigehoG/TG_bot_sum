@@ -1,3 +1,5 @@
+import debugpy
+
 """Начальная настройка!
 В BotFather с помощью команды /setprivacy, необходимо выключить "Disabled" (Выключено) Режим конфиденциальности (Privacy Mode)
 Создать .env файл с одноименными параметрами TELEGRAM_TOKEN=12345, и т.д. """
@@ -9,6 +11,7 @@ import uuid
 import re
 from datetime import datetime, timedelta
 import time
+from types import SimpleNamespace
 from annotated_types import LowerCase
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -17,14 +20,14 @@ from dotenv import load_dotenv
 from os import getenv
 import random
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION, CommandObject
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, ChatMemberRestricted, ChatMemberLeft, \
 	ChatMemberBanned, ChatMemberMember, ChatPermissions, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, \
-	Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, BotCommand
-from aiogram.exceptions import TelegramForbiddenError
+	Message, CallbackQuery, BufferedInputFile, BotCommand
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import html  # Для экранирования HTML-символов в именах пользователей
 
@@ -42,19 +45,23 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
 
 # Загрузка конфигурации
 load_dotenv()
-ADMIN_ID = getenv("ADMIN_ID")
+ADMIN_ID_STR = getenv("ADMIN_ID")
 TELEGRAM_TOKEN = getenv("TELEGRAM_TOKEN")
+
+ADMIN_ID = None
+if ADMIN_ID_STR:
+	try:
+		ADMIN_ID = int(ADMIN_ID_STR)
+	except ValueError:
+		logging.error("ADMIN_ID в .env файле не является корректным числом. Функции администратора могут не работать.")
 
 # Настройка Gemini
 GOOGLE_API_KEY = getenv("GOOGLE_API_KEY")
 gclient = genai.Client(api_key=GOOGLE_API_KEY)
 
-#RAPIDAPI_KEY = getenv("RAPIDAPI_KEY")
 REDIS_HOST = getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(getenv("REDIS_PORT", 6379))
 
-
-ADMIN_IDS = {ADMIN_ID}
 
 # Конфигурация лимитов
 LOCK_FOR_SUMMARIZE = set()
@@ -303,7 +310,7 @@ async def summarize(message: Message, command: CommandObject): # <-- Измен�
 		])
 
 		await bot.send_message(
-			int(ADMIN_ID),
+			ADMIN_ID,
 			f"⚠️ Новый запрос на доступ:\n"
 			f"User: {message.from_user.full_name} (@{user_nm})\n"
 			f"Группа: {chat_Ti}\n"
@@ -692,9 +699,54 @@ async def handle_approval(callback: CallbackQuery):
 
 	await callback.answer()
 
+
+# Команда для добавления хеша в белый список
+@dp.message(Command("bw"))
+async def whitelist_bayan(message: Message):
+	"""
+	Добавляет хеш изображения/превью из отвеченного сообщения в белый список баянов.
+	"""
+	try:
+		if message.from_user.id not in await get_admins(message.chat.id):
+			await del_msg_delay(await message.reply("Эта команда доступна только администраторам."))
+			return
+
+		if not message.reply_to_message:
+			await del_msg_delay(await message.reply("Нужно ответить на сообщение с картинкой или видео."))
+			return
+
+		reply = message.reply_to_message
+		file_id = None
+		if reply.photo:
+			file_id = reply.photo[-1].file_id # Берем самое качественное
+		elif reply.video and reply.video.thumbnail:
+			file_id = reply.video.thumbnail.file_id
+
+		if not file_id:
+			await del_msg_delay(await message.reply("В сообщении не найдено подходящей картинки или превью."))
+			return
+
+		hash_val = await get_image_hash(file_id)
+		if not hash_val:
+			await del_msg_delay(await message.reply("Не удалось получить хеш изображения."))
+			return
+
+		key = f"chat:{message.chat.id}:bayan_whitelist"
+		is_new = await r.hset(key, hash_val, 1) # Используем 1 как простое значение-флаг
+		if is_new:
+			await del_msg_delay(await message.reply(f"✅ Хеш <code>{hash_val}</code> добавлен в белый список баянов."))
+		else:
+			await del_msg_delay(await message.reply(f"ℹ️ Хеш <code>{hash_val}</code> уже был в белом списке."))
+	finally:
+		try:
+			await message.delete()  # Удаляем команду в любом случае
+		except Exception as e:
+			# Логируем, но не падаем, если не удалось удалить
+			logging.warning(f"Не удалось удалить команду /bw от {message.from_user.id} в чате {message.chat.id}: {e}")
+
 ########## Чекаем баяны ########
-async def get_image_hash(file_id: str) -> str:
-	"""Получает dHash изображения по file_id."""
+async def get_image_hash(file_id: str) -> str | None:
+	"""Получает dHash изображения по file_id. Возвращает None в случае ошибки."""
 	try:
 		# Получаем информацию о файле
 		file = await bot.get_file(file_id)
@@ -709,64 +761,119 @@ async def get_image_hash(file_id: str) -> str:
 		file_bytes.close()
 		return str(hash_val)
 	except Exception as e:
-		raise RuntimeError(f"Ошибка при получении hash: {e}")
-
+		# Не падать, просто логировать и вернуть None
+		logging.error(f"Ошибка при получении hash для file_id {file_id}: {e}")
+		return None
 # Функция для вычисления расстояния Хэмминга
 async def hamming_distance(hash1, hash2):
 	if len(hash1) != len(hash2):
 		raise ValueError("Хэши должны быть одинаковой длины")
 	return sum(c1 != c2 for c1, c2 in zip(hash1, hash2))
 
-# Функция для поиска похожих хэшей в Redis
-async def find_similar_hashes(new_hash, hash_r_key, max_diff=5):	
-	try:
-		field = await r.hget(hash_r_key,new_hash)
-		return json.loads(field)['id']
-	except:
-		# Получение только полей
-		saved_hashes = await r.hkeys(hash_r_key)
+# Функция для поиска похожих хэшей в хэш-таблице Redis
+async def find_similar_hash_in_hset(new_hash: str, redis_key: str, max_diff: int) -> tuple[str, str] | None:
+	"""
+	Ищет похожий хэш в хэш-таблице Redis.
+	Сначала ищет точное совпадение, затем похожие.
+	Возвращает кортеж (найденный_хеш, значение) или None.
+	"""
+	# 1. Проверка на точное совпадение для производительности
+	exact_match_value = await r.hget(redis_key, new_hash)
+	if exact_match_value:
+		return new_hash, exact_match_value
 
-		# Сравниваем новый хеш с каждым сохранённым
-		for hash in saved_hashes:
-				# Если расстояние Хэмминга меньше или равно max_diff, добавляем хэш
-				if await hamming_distance(new_hash, hash) <= max_diff:
-					return (json.loads(await r.hget(hash_r_key,hash)))['id']
-		return None
+	# 2. Если точного совпадения нет, ищем похожие
+	all_hashes = await r.hkeys(redis_key)
+	for saved_hash in all_hashes:
+		if await hamming_distance(new_hash, saved_hash) <= max_diff:
+			value = await r.hget(redis_key, saved_hash)
+			return saved_hash, value # Возвращаем кортеж (хеш, значение)
+	return None
 
+# Функция для проверки, является ли сообщение баяном
 async def check_bayan(message: Message):
 	key = f"chat:{message.chat.id}:bayan"
+	whitelist_key = f"chat:{message.chat.id}:bayan_whitelist"
 	chat_id = message.chat.id
 	message_id = message.message_id
 	bayan = False
+	file_id = None
 
 	if message.photo:
-		file_id = message.photo[0].file_id
-	if message.video:
+		file_id = message.photo[-1].file_id # Берем самое качественное для точности
+	elif message.video and message.video.thumbnail:
 		file_id = message.video.thumbnail.file_id
 	
+	if not file_id:
+		return bayan
+
 	# Получаем хеш нового изображения
 	new_hash = await get_image_hash(file_id)
 
-	id = await find_similar_hashes(new_hash, key, max_diff=BAYANDIFF)
-	if id:
-		gif_list = (['CgACAgIAAxkBAAIDDmf9qNvELAABV1bhizjsVWVdg_oDYwACjQAD24TBAwNGZWxV-v8LNgQ'], # баба кидает
-					['CgACAgQAAxkBAAIDD2f9xJ5wVliPMOyIkLBYFIjVyckiAALEOQAC7hdkB6taFHfHHCwtNgQ'], # в сене находит
-					['CgACAgQAAxkBAAIDEGf9xrNV-0FR9CwXnRTzR9as3lOyAALpAgACdgQUUx8P27eBaYgLNgQ'], # Джери
-					['CgACAgQAAxkBAAIDEWf9x0Z0QSCD0eWCudKndoLwIHaTAAJSAwAC-RAEU2Tw7_4c3dtnNgQ'], # Пингвин
-					['CgACAgQAAxkBAAIDGmf9z3yk_q374r08VTF5MVgqE0UgAAIlAwAClTENU85HwIjkanSyNgQ']) # Мужик
-		gif_id = (random.choice(gif_list))[0]
-		# Для приватной супергруппы убираем префикс "-100"
-		chat_id_str = str(chat_id)[4:]        # '1473943182'
-		if message.chat.username:
-			turl = f"t.me/{message.chat.username}/{id}"
-		else:
-			turl = f"t.me/c/{chat_id_str}/{id}"
-		
-		bayan = True
+	if not new_hash:
+		return bayan # Не удалось создать хеш, считаем не баяном
+
+	# Проверяем, есть ли похожий хеш в белом списке
+	if await find_similar_hash_in_hset(new_hash, whitelist_key, max_diff=BAYANDIFF):
+		logging.info(f"Хеш {new_hash} (или похожий) в белом списке для чата {chat_id}. Проверка на баян пропущена.")
+		return bayan
+
+	# Ищем похожий хеш в истории баянов
+	bayan_match = await find_similar_hash_in_hset(new_hash, key, max_diff=BAYANDIFF)
+	if bayan_match:
+		saved_hash, bayan_value_json = bayan_match
+		original_message_id = json.loads(bayan_value_json)['id']
+
+		# --- Проверяем, существует ли исходное сообщение ---
 		try:
-			await message.reply_animation(animation=gif_id, caption=f"Архивная запись №{id}!   [Оригинал тут]({turl})",parse_mode=ParseMode.MARKDOWN)			
+			if not ADMIN_ID:
+				logging.warning("ADMIN_ID не установлен. Проверка существования баяна пропускается.")
+				raise ValueError("Admin ID not set")
+
+			# Копируем сообщение в чат с админом, чтобы проверить его существование.
+			# Сразу удаляем копию, чтобы не беспокоить.
+			copied_message_id_obj = await bot.copy_message(
+				chat_id=ADMIN_ID,
+				from_chat_id=chat_id,
+				message_id=original_message_id,
+				disable_notification=True
+			)
+			# Удаляем скопированное сообщение, используя его ID
+			await bot.delete_message(chat_id=ADMIN_ID, message_id=copied_message_id_obj.message_id)
+
+			# --- Сообщение существует, это баян ---
+			id = original_message_id
+			gif_list = (['CgACAgIAAxkBAAIDDmf9qNvELAABV1bhizjsVWVdg_oDYwACjQAD24TBAwNGZWxV-v8LNgQ'], # баба кидает
+						['CgACAgQAAxkBAAIDD2f9xJ5wVliPMOyIkLBYFIjVyckiAALEOQAC7hdkB6taFHfHHCwtNgQ'], # в сене находит
+						['CgACAgQAAxkBAAIDEGf9xrNV-0FR9CwXnRTzR9as3lOyAALpAgACdgQUUx8P27eBaYgLNgQ'], # Джери
+						['CgACAgQAAxkBAAIDEWf9x0Z0QSCD0eWCudKndoLwIHaTAAJSAwAC-RAEU2Tw7_4c3dtnNgQ'], # Пингвин
+						['CgACAgQAAxkBAAIDGmf9z3yk_q374r08VTF5MVgqE0UgAAIlAwAClTENU85HwIjkanSyNgQ']) # Мужик
+			gif_id = (random.choice(gif_list))[0]
+			# Для приватной супергруппы убираем префикс "-100"
+			chat_id_str = str(chat_id)[4:]        # '1473943182'
+			if message.chat.username:
+				turl = f"t.me/{message.chat.username}/{id}"
+			else:
+				turl = f"t.me/c/{chat_id_str}/{id}"
+			
+			bayan = True
+			try:
+				await message.reply_animation(animation=gif_id, caption=f"Архивная запись №{id}!   [Оригинал тут]({turl})",parse_mode=ParseMode.MARKDOWN)
+			except Exception as e:
+				logging.error(f"Нет гивки в чате: {e}")
+		except TelegramBadRequest as e:
+			if "message to copy not found" in e.message:
+				# --- Исходное сообщение удалено, обновляем базу ---
+				logging.info(f"Исходный баян (msg_id: {original_message_id}) удален. Обновляем запись в Redis.")
+				await r.hdel(key, saved_hash) # Удаляем старый хеш
+				await r.hset(key, new_hash, json.dumps({'id': message_id})) # Добавляем новый
+				bayan = False # Это уже не баян
+			else:
+				logging.error(f"Ошибка Telegram API при проверке баяна: {e}")
+				bayan = False # В случае другой ошибки считаем, что не баян
 		except Exception as e:
-			logging.error(f"Нет гивки в чате: {e}")		
+			logging.error(f"Неожиданная ошибка при проверке баяна: {e}")
+			bayan = False # Безопаснее считать, что не баян
 	else:
 		await r.hset(key, new_hash, json.dumps({'id': message_id}))
 	return bayan
@@ -843,6 +950,7 @@ async def generate_pil_image(top_users, title):
 	output.seek(0)  # Перемещаем указатель в начало
 	return output
 
+# вывод топа пользователей
 @dp.message(Command("top_u"))
 async def get_top_users(message: Message, command: CommandObject) -> list:
 	chat_id = message.chat.id	
@@ -984,6 +1092,24 @@ def humanize_value_for_chars(num: int) -> str: # Переименовано
 	else:
 		return str(num)
 
+def get_user_markdown_link(user_or_chat: types.User | types.Chat) -> str:
+	"""
+	Создает Markdown-ссылку на пользователя (для parse_mode="Markdown").
+	Безопасно экранирует спецсимволы в имени.
+	"""
+	def escape_markdown_v1(text: str) -> str:
+		if not text: return ""
+		# Экранируем только _ * [ ] ( ) `, оставляя остальные символы как есть
+		return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
+
+	full_name = getattr(user_or_chat, 'full_name', 'Unknown User')
+	user_id = user_or_chat.id
+	
+	escaped_name = escape_markdown_v1(full_name)
+	user_url = f"tg://user?id={user_id}"
+	
+	return f"[{escaped_name}]({user_url})"
+
 ############# Вход и выход из чата ##########
 async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 	# Извлекаем чистые имена из Markdown-ссылок для передачи в AI
@@ -1078,35 +1204,62 @@ async def apply_progressive_ban(chat_id: int, user_id: int, reason_log: str):
 # Выход из чата
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
 async def off_member(event: ChatMemberUpdated):
-    member = event.new_chat_member.user
-    logging.info(f"Выход: из чата {event.chat.title} - {member.full_name} {event.new_chat_member}")
+	# --- НОВАЯ ЛОГИКА: Проверяем, не бота ли удалили ---
+	if event.new_chat_member.user.id == bot.id:
+		chat_id = event.chat.id
+		logging.warning(f"Бот был удален из чата '{event.chat.title}' ({chat_id}). Начинаю полную очистку данных.")
+		
+		# Используем SCAN для поиска всех ключей, связанных с этим чатом
+		keys_to_delete = [key async for key in r.scan_iter(f"chat:{chat_id}:*")]
+		
+		if keys_to_delete:
+			await r.delete(*keys_to_delete)
+			logging.info(f"Удалено {len(keys_to_delete)} ключей из Redis для чата {chat_id}.")
+		else:
+			logging.info(f"Не найдено ключей для удаления для чата {chat_id}.")
+		return # Завершаем обработку, т.к. бот больше не в чате
 
-    # 1. Централизованно удаляем все связанные с проверкой сообщения и данные из Redis.
-    # Это решает проблему с неполной очисткой.
-    await cleanup_verification_data(event.chat.id, member.id)
+	member = event.new_chat_member.user
+	chat_id = event.chat.id
 
-    # 2. Определяем причину выхода и отправляем соответствующее сообщение.
-    if isinstance(event.new_chat_member, ChatMemberBanned):
-        # Если бан инициирован ботом (например, за провал проверки),
-        # то сообщение уже отправлено из соответствующей функции (check_new_members).
-        # Пропускаем, чтобы избежать дублирования.
-        if event.from_user.is_bot:
-            logging.info(f"Бан для {member.full_name} инициирован ботом. Сообщение в off_member пропускается.")
-            return
+	# --- НОВАЯ ЛОГИКА: Проверка на быстрый выход (во время отсчета) ---
+	countdown_key = f"chat:{chat_id}:in_countdown"
+	if await r.sismember(countdown_key, member.id):
+		# Пользователь вышел во время отсчета. Баним его.
+		logging.warning(f"Пользователь {member.full_name} ({member.id}) покинул чат во время отсчета. Применяется бан.")
+		reason = f"покинул чат во время приветственного отсчета"
+		await apply_progressive_ban(chat_id, member.id, reason)
+		# Удаляем его из сета, чтобы new_member не пытался с ним работать
+		await r.srem(countdown_key, member.id)
+		return # Завершаем обработку, не нужно отправлять прощальное сообщение
 
-        # Создаем надежные ссылки на пользователей, используя .url вместо .username
-        kicked_user_link = f"[{html.escape(member.full_name)}]({member.url})"
-        admin_user_link = f"[{html.escape(event.from_user.full_name)}]({event.from_user.url})"
-        
-        # Генерируем и отправляем сообщение о бане (для ручных банов админами)
-        kick_message_text = await kick_msg(admin_user_link, kicked_user_link, event.from_user.is_bot)
-        await event.answer(kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
+	# --- СТАРАЯ ЛОГИКА: Обработка выхода обычного пользователя ---
+	logging.info(f"Выход: из чата {event.chat.title} - {member.full_name}")
 
-    elif isinstance(event.new_chat_member, ChatMemberLeft):
-        # Простое сообщение о том, что пользователь ушел сам (ранее не обрабатывалось)
-        await event.answer(
-            f"👋 Гудбай [{html.escape(member.full_name)}]({member.url})",
-            parse_mode="Markdown", disable_web_page_preview=True)
+	# 1. Централизованно удаляем все связанные с проверкой сообщения и данные из Redis.
+	# Это решает проблему с неполной очисткой.
+	await cleanup_verification_data(event.chat.id, member.id)
+
+	# 2. Определяем причину выхода и отправляем соответствующее сообщение.
+	if isinstance(event.new_chat_member, ChatMemberBanned):
+		# Если бан инициирован ботом (например, за провал проверки),
+		# то сообщение уже отправлено из соответствующей функции (check_new_members).
+		# Пропускаем, чтобы избежать дублирования.
+		if event.from_user.is_bot:
+			logging.info(f"Бан для {member.full_name} инициирован ботом. Сообщение в off_member пропускается.")
+			return
+
+		# Создаем надежные ссылки на пользователей, используя .url вместо .username
+		kicked_user_link = get_user_markdown_link(member)
+		admin_user_link = get_user_markdown_link(event.from_user)
+		
+		# Генерируем и отправляем сообщение о бане (для ручных банов админами)
+		kick_message_text = await kick_msg(admin_user_link, kicked_user_link, event.from_user.is_bot)
+		await event.answer(kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+	elif isinstance(event.new_chat_member, ChatMemberLeft):
+		# Простое сообщение о том, что пользователь ушел сам (ранее не обрабатывалось)
+		await event.answer(f"👋 Гудбай {get_user_markdown_link(member)}", parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 
 # Обработчик новых участников
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
@@ -1118,6 +1271,11 @@ async def new_member(event: ChatMemberUpdated):
 	logging.info(f"Вход! Новенького в чате {chat_Ti} - {new_member.full_name}")
 
 	if not new_member.is_bot:
+		# --- НОВАЯ ЛОГИКА: Регистрация пользователя в списке ожидания ---
+		countdown_key = f"chat:{chat_id}:in_countdown"
+		await r.sadd(countdown_key, user_id)
+		await r.expire(countdown_key, 60) # 60 секунд - с запасом
+
 		await user_lock_unlock(user_id, chat_id, st="lock")
 		# --- Список весёлых сообщений для обратного отсчёта ---
 		countdown_templates = [
@@ -1144,56 +1302,60 @@ async def new_member(event: ChatMemberUpdated):
 			initial_message,
 			parse_mode="HTML"
 		)
-		for sec in range(9, 0, -1): # Начинаем с 9, т.к. 10 уже отправили
+		for sec in range(9, -1, -1):
 			try:
 				await asyncio.sleep(1)
+				# Если пользователь на месте, редактируем сообщение
 				next_message = chosen_template.format(url=new_member.url, name=full_name_html, sec=sec)
 				await countdown_msg.edit_text(next_message, parse_mode="HTML")
-				# Проверяем статус пользователя на каждом шаге
-				member_status = await bot.get_chat_member(chat_id, user_id)
-				if member_status.status not in ["member", "restricted"]:					
-					await countdown_msg.delete()
-					reason = f"покинул чат во время отсчета ({new_member.full_name})"
-					await apply_progressive_ban(chat_id, user_id, reason)
-					return
+			except TelegramBadRequest as e:
+				if "message to edit not found" in e.message.lower():
+					logging.warning(f"Сообщение для отсчета {countdown_msg.message_id} было удалено. Прерываю отсчет.")
+					await r.srem(countdown_key, user_id) # Очищаем ключ
+					return # Сообщения нет, делать нечего
 			except Exception as e:
 				logging.error(f"Ошибка при обновлении отсчёта или проверке статуса: {e}")
+				await r.srem(countdown_key, user_id) # Очищаем ключ
 				await countdown_msg.delete()
 				return
-		# Финальная проверка
-		try:
-			member_status = await bot.get_chat_member(chat_id, user_id)
-			if member_status.status in ["member", "restricted"]:
-				await countdown_msg.delete()
-				# Сообщение с просьбой картинки (HTML + экранирование)
-				full_name_html = (
-					f'<a href="{new_member.url}">{html.escape(new_member.full_name)}</a>'
-				)
-				check_msg = await bot.send_message(
-					chat_id,
-					f"👋 Привет, {full_name_html}!\n"
-					f"Пройди простую проверку.\n\n"
-					f"<b>Ответь</b> на <b>это</b> сообщение <u>картинкой велосипеда</u>.\n"
-					f"Иначе не сможешь отправлять сообщения 🤐\n"
-					f"и вскоре тебя исключат 👢💥🍑. (⌛{TIME_TO_BAN_HOURS}ч.)",
-					parse_mode="HTML"
-				)
-				# Сохраняем все id сообщений проверки
-				check_data = {
-					"message_id": check_msg.message_id,
-					"full_name": new_member.full_name,
-					"join_time": int(time.time()),
-					"notified": False,
-					"reminder_id": None,
-					"ban_id": None
-				}
-				await r.hset(f"chat:{chat_id}:new_user_join", new_member.id, json.dumps(check_data))
-				# Вся логика напоминания и бана теперь только в check_new_members
-			else:
-				await countdown_msg.delete()
-		except Exception as e:
-			logging.error(f"Ошибка при финальной проверке статуса нового пользователя: {e}")
+		# --- ФИНАЛЬНАЯ ПРОВЕРКА ---
+		# Проверяем, не покинул ли пользователь чат во время отсчета (off_member должен был удалить его из сета).
+		if not await r.sismember(countdown_key, user_id):
+			logging.info(f"Пользователь {user_id} покинул чат во время отсчета. Обработка завершена в off_member.")
 			await countdown_msg.delete()
+			return
+
+		# Если пользователь дождался, удаляем его из временного сета и продолжаем
+		await r.srem(countdown_key, user_id)
+		try:
+			await countdown_msg.delete()
+		except Exception as e:
+			logging.warning(f"Не удалось удалить сообщение отсчета: {e}")
+
+		# Сообщение с просьбой картинки (HTML + экранирование)
+		full_name_html = (
+			f'<a href="{new_member.url}">{html.escape(new_member.full_name)}</a>'
+		)
+		check_msg = await bot.send_message(
+			chat_id,
+			f"👋 Привет, {full_name_html}!\n"
+			f"Пройди простую проверку.\n\n"
+			f"<b>Ответь</b> на <b>ЭТО</b> сообщение <u>картинкой велосипеда</u>.\n"
+			f"Иначе не сможешь отправлять сообщения 🤐 "
+			f"и вскоре тебя исключат 👢💥🍑. (⌛{TIME_TO_BAN_HOURS}ч.)",
+			parse_mode="HTML"
+		)
+		# Сохраняем все id сообщений проверки
+		check_data = {
+			"message_id": check_msg.message_id,
+			"full_name": new_member.full_name,
+			"join_time": int(time.time()),
+			"notified": False,
+			"reminder_id": None,
+			"ban_id": None
+		}
+		await r.hset(f"chat:{chat_id}:new_user_join", new_member.id, json.dumps(check_data))
+		# Вся логика напоминания и бана теперь только в check_new_members
 
 	else:
 		await user_lock_unlock(user_id, chat_id, st="lock")
@@ -1205,26 +1367,30 @@ async def new_member(event: ChatMemberUpdated):
 			parse_mode="Markdown"
 		)
 
-async def generate_image_description(image: Image.Image) -> str:
+async def generate_image_description(image: Image.Image) -> bool | None:
+	"""
+	Определяет, есть ли на картинке велосипед.
+	Возвращает True, если есть, False, если нет, и None в случае ошибки или нечеткого ответа.
+	"""
 	try:
 		# Формируем запрос (можно кастомизировать)
-		prompt = "Определи есть ли на картинке велосипед и отвть булевым значением True/False"		
+		prompt = "Определи есть ли на картинке велосипед и ответь одним словом: True или False."
 
 		# Генерируем контент асинхронно
 		response = await gclient.aio.models.generate_content(
 			model="gemini-2.5-flash",
 			contents=[image, prompt]
 		)
-		return eval(response.text) or "Не удалось получить описание. Попробуйте другую картинку"
+		response_text = response.text.strip().lower()
+		return response_text == 'true' if response_text in ['true', 'false'] else None
 	except Exception as e:
 		logging.error(f"Ошибка в generate_image_description: {e}")
-		# В реальном приложении здесь лучше использовать logging
-		return f"Ошибка при обращении к Gemini: {e}"
+		return None
 
 ## Ограничиваем возможности пользователя (блокируем отправку сообщений) | расширеный
 async def user_lock_unlock(user_id: int, chat_id: int, **kwargs):
 	now = datetime.now()
-	duration = timedelta(seconds=33)
+	duration = timedelta(seconds=15)
 	future_date = now + duration
 	try:
 		if kwargs['st'] == 'lock':  # Блокировка
@@ -1232,14 +1398,14 @@ async def user_lock_unlock(user_id: int, chat_id: int, **kwargs):
 				chat_id=chat_id,
 				user_id=user_id,
 				permissions=ChatPermissions(
-					can_send_photos=True
+					can_send_photos=True # Разрешаем только фото для проверки
 				),
 				until_date=0  # 0 или None – ограничение бессрочное
 			)
 			logging.info(f"{user_id} - Отправка сообщений заблокирована.")
 
 		elif kwargs['st'] == "unlock":  # Разблокировка
-
+			# Снимаем все ограничения, возвращая стандартные права после 15 сек.
 			await bot.restrict_chat_member(
 				chat_id=chat_id,
 				user_id=user_id,
@@ -1291,16 +1457,16 @@ async def check_new_members():
 		chat_id = key.split(":")[1]
 		members = await r.hgetall(key)
 		for user_id, data in members.items():
-			data = json.loads(data)
-			join_time = data["join_time"]
-			current_time = int(time.time())
-			time_elapsed = current_time - join_time
+			try:
+				data = json.loads(data)
+				join_time = data["join_time"]
+				current_time = int(time.time())
+				time_elapsed = current_time - join_time
 
-			if time_elapsed >= NOTIFY_AFTER_SECONDS and not data.get('notified', False):
-				user_nm = data.get('full_name', f'user_{user_id}')
-				msg_id = data.get('message_id')
-				chat_id_str = str(chat_id)[4:] if str(chat_id).startswith('-100') else str(chat_id)
-				try:
+				if time_elapsed >= NOTIFY_AFTER_SECONDS and not data.get('notified', False):
+					user_nm = data.get('full_name', f'user_{user_id}')
+					msg_id = data.get('message_id')
+					chat_id_str = str(chat_id)[4:] if str(chat_id).startswith('-100') else str(chat_id)
 					reminder = await bot.send_message(
 						chat_id=int(chat_id),
 						text=f"⏰ [{user_nm}](tg://user?id={user_id}), не забудь пройти проверку!\nОсталось {int((TIME_TO_BAN_SECONDS - time_elapsed)//60)} мин. до 👢💥🍑.\nОтветь на [запрос бота](https://t.me/c/{chat_id_str}/{msg_id})",
@@ -1309,37 +1475,46 @@ async def check_new_members():
 					data['notified'] = True
 					data['reminder_id'] = reminder.message_id
 					await r.hset(key, user_id, json.dumps(data))
-				except Exception as e:
-					logging.error(f"Ошибка при отправке уведомления {user_id} в чат {chat_id}: {e}")
 
-			if time_elapsed > TIME_TO_BAN_SECONDS:
-				user_nm = data.get('full_name', f'user_{user_id}')
-				try:
+				if time_elapsed > TIME_TO_BAN_SECONDS:
+					user_nm = data.get('full_name', f'user_{user_id}')
 					# Применяем прогрессивный бан
 					reason = f"провал проверки ({user_nm})"
 					await apply_progressive_ban(int(chat_id), int(user_id), reason)
 
 					# --- ЯВНАЯ ОТПРАВКА СООБЩЕНИЯ О БАНЕ ---
 					bot_user = await bot.get_me()
-					bot_link = f"[{html.escape(bot_user.full_name)}]({bot_user.url})"
-					kicked_user_link = f"[{html.escape(user_nm)}](tg://user?id={user_id})"
-					
+					bot_link = get_user_markdown_link(bot_user)
+					# Создаем "утиный" объект пользователя (duck-typing) для передачи в get_user_markdown_link
+					kicked_user_obj = SimpleNamespace(id=int(user_id), full_name=user_nm)
+					kicked_user_link = get_user_markdown_link(kicked_user_obj)
+
 					kick_message_text = await kick_msg(bot_link, kicked_user_link, True)
-					
+
 					ban_msg = await bot.send_message(
 						chat_id=int(chat_id),
 						text=kick_message_text,
 						parse_mode="Markdown",
 						disable_web_page_preview=True
 					)
-					
+
 					# Запускаем отложенное удаление сообщения о бане
 					asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
 
 					# Очищаем данные и сообщения, связанные с проверкой
 					await cleanup_verification_data(int(chat_id), int(user_id))
-				except Exception as e:
-					logging.error(f"Ошибка при исключении {user_id} из чата {chat_id}: {e}")
+			except TelegramBadRequest as e:
+				if 'chat not found' in e.message.lower():
+					logging.warning(f"Chat {chat_id} not found. Cleaning up all stale Redis data for this chat.")
+					keys_to_delete = [key async for key in r.scan_iter(f"chat:{chat_id}:*")]
+					if keys_to_delete:
+						await r.delete(*keys_to_delete)
+						logging.info(f"Удалено {len(keys_to_delete)} ключей из Redis для чата {chat_id}.")
+					break # Прерываем цикл по пользователям этого чата и переходим к следующему ключу чата
+				else:
+					logging.error(f"Telegram bad request error for user {user_id} in chat {chat_id}: {e}")
+			except Exception as e:
+				logging.error(f"Ошибка при обработке {user_id} в чате {chat_id}: {e}")
 
 # приветствие нового участника
 @dp.message(Command("hello_m"))
@@ -1349,18 +1524,8 @@ async def cmd_info(message: Message):
 			await message.reply("Напиши текст приветствия после команды /hello_m")
 			return
 		# Сохраняем сообщение в Redis
-		await r.set(f"chat:{message.chat.id}:Hello_msg",message.md_text.split(' ', 1)[1])
+		await r.set(f"chat:{message.chat.id}:Hello_msg",message.html_text.split(' ', 1)[1])
 		await message.reply(f"🫡")
-
-def escape_markdown_v2(name: str) -> str:
-	"""Экранирует специальные символы MarkdownV2 в тексте."""
-	# Для простоты, сначала можно экранировать все символы, которые имеют значение в MarkdownV2.
-	# Если вы не используете эти символы для форматирования внутри FNAME, то экранирование их будет безопасным.
-	# pattern = r"([_*\[\]()~`>#+\-=|{}.!])"
-	# return re.sub(pattern, r"\\\1", text)
-	chars_to_escape = '_*[]()~`>#+-=|\{\}.!' # Включаем все, что может быть проблемой
-	escaped_text = "".join(['\\' + char if char in chars_to_escape else char for char in name])
-	return escaped_text
 
 
 async def _handle_verification_message(message: Message) -> bool:
@@ -1368,6 +1533,30 @@ async def _handle_verification_message(message: Message) -> bool:
 	Обрабатывает все сообщения, связанные с верификацией новых пользователей.
 	Возвращает True, если сообщение было обработано, и False в противном случае.
 	"""
+	# Вспомогательная функция для надежного извлечения ID пользователя из ссылки в сообщении.
+	# Она будет использоваться и для проверки ответа пользователя, и для команд админа.
+	def extract_user_id_from_message(msg: Message) -> int | None:
+		# 1. Try to get from entities (most reliable for user-sent messages)
+		if msg.entities:
+			for entity in msg.entities:
+				# Ищем ссылку вида <a href="tg://user?id=12345">...</a>
+				if entity.type == "text_link" and entity.url and "tg://user?id=" in entity.url:
+					try:
+						return int(entity.url.split("=")[-1])
+					except (ValueError, IndexError):
+						continue
+
+		# 2. Fallback to parsing html_text (for bot-sent messages)
+		if msg.html_text:
+			match = re.search(r'href="tg://user\?id=(\d+)"', msg.html_text)
+			if match:
+				try:
+					return int(match.group(1))
+				except (ValueError, IndexError):
+					pass # Should not happen with this regex, but good to be safe
+
+		return None # Если не нашли ни одним из способов
+
 	chat = message.chat
 	chat_id = chat.id
 	user_id = message.from_user.id
@@ -1387,10 +1576,9 @@ async def _handle_verification_message(message: Message) -> bool:
 
 		# ПРАВИЛО 2: Пользователь ответил на сообщение-проверку.
 		if message.reply_to_message and message.reply_to_message.from_user.is_bot:
-			pattern = r'tg://user\?id=(\d+)'
-			match = re.search(pattern, message.reply_to_message.md_text)
+			verified_user_id_from_reply = extract_user_id_from_message(message.reply_to_message)
 			# Убедимся, что он отвечает на СВОЮ проверку
-			if match and int(match.group(1)) == user_id:
+			if verified_user_id_from_reply and verified_user_id_from_reply == user_id:
 				if message.photo:
 					# Это правильный сценарий, обрабатываем фото.
 					try:
@@ -1404,20 +1592,24 @@ async def _handle_verification_message(message: Message) -> bool:
 							if member_status.status not in ("left", "kicked", "banned"):
 								await user_lock_unlock(user_id, chat_id, st="unlock")
 								user_obj = await bot.get_chat(chat_id=user_id)
-								FNAME = escape_markdown_v2(user_obj.full_name or "No_Name")
-								hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте FNAME, нового участника\\! 👋\n").replace('FNAME', FNAME)
+								FNAME = get_user_markdown_link(user_obj)
+								hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте {FNAME}, нового участника! 👋\n").replace('FNAME', FNAME)
 								await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 								await cleanup_verification_data(chat_id, user_id)
 							else:
 								logging.warning(f"Пользователь {user_id} покинул чат до завершения проверки.")
 								await cleanup_verification_data(chat_id, user_id)
+						elif description is False:
+							# AI сказал "False" - велосипеда нет
+							await message.reply("На этой картинке нет велосипеда. Попробуй другую. 🚲")
+							await message.delete()
 						else:
-							answ = "Не удалось найти велосипед 😢" if not description else str(description)
-							await message.reply(answ)
-							await bot.delete_message(chat_id, message.message_id)
+							# description is None - ошибка или неожиданный ответ
+							await message.reply("Не удалось распознать изображение. Пожалуйста, попробуйте отправить другую, более четкую картинку.")
+							await message.delete()
 					except Exception as e:
 						logging.error(f"Ошибка при обработке фото для верификации: {e}", exc_info=True)
-						await message.reply(f"Не удалось обработать фото. Попробуйте еще раз.\n{e}")
+						await message.reply(f"Не удалось обработать фото. Попробуйте еще раз.")
 				return True
 
 		# ПРАВИЛО 3: Любое другое сообщение от пользователя на верификации -> удаление и напоминание.
@@ -1428,40 +1620,50 @@ async def _handle_verification_message(message: Message) -> bool:
 
 	# --- БЛОК 2: Обработка ответов от админов на сообщения о верификации ---
 	if message.reply_to_message and message.reply_to_message.from_user.is_bot:
-		pattern = r'tg://user\?id=(\d+)'
-		match = re.search(pattern, message.reply_to_message.md_text)
-		if match:
-			verified_user_id = int(match.group(1))
-			# Проверяем, что админ отвечает на всё ещё активную проверку
-			if await r.hexists(key_u_j, verified_user_id):
-				admins = await get_admins(chat_id)
-				if user_id in admins and message.text:
-					text_lower = message.text.lower()
-					if "принят" in text_lower:
-						await user_lock_unlock(verified_user_id, chat_id, st="unlock")
-						user_obj = await bot.get_chat(chat_id=verified_user_id)
-						FNAME = escape_markdown_v2(user_obj.full_name or "No_Name")
-						hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте FNAME, нового участника\\! 👋\n").replace('FNAME', FNAME)
-						await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
-						await cleanup_verification_data(chat_id, verified_user_id)
-					elif "бан" in text_lower:
-						reason = f"команда 'бан' от администратора {message.from_user.full_name}"
-						await apply_progressive_ban(chat_id, verified_user_id, reason)
-						banned_user_obj = await bot.get_chat(verified_user_id)
-						banned_user_link = f"[{html.escape(banned_user_obj.full_name)}]({banned_user_obj.url})"
-						admin_user_link = f"[{html.escape(message.from_user.full_name)}]({message.from_user.url})"
-						kick_message_text = await kick_msg(admin_user_link, banned_user_link, False)
-						ban_msg = await bot.send_message(chat_id, kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
-						asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
-						await message.delete()
-						await cleanup_verification_data(chat_id, verified_user_id)
-					else:
-						await del_msg_delay(await message.reply("Можно только 'Принят!' или 'Бан!'."))
-					return True
-			else:
-				# Админ (или пользователь) отвечает на уже завершенную проверку
-				await del_msg_delay(await message.reply("Уже всё, поздно 😏"))
-				return True
+		verified_user_id = extract_user_id_from_message(message.reply_to_message)
+		if not verified_user_id:
+			# Улучшаем сообщение об ошибке, чтобы админ понял, в чем дело.
+			# Скорее всего, он ответил не на то сообщение бота (например, на уведомление о баяне).
+			await del_msg_delay(await message.reply("Не удалось определить пользователя. Убедитесь, что вы отвечаете на сообщение о входе нового участника или на запрос о проверке."))
+			return True
+
+		# Проверяем, что проверка ещё активна
+		if not await r.hexists(key_u_j, verified_user_id):
+			await del_msg_delay(await message.reply("Уже всё, поздно 😏"))
+			return True
+
+		admins = await get_admins(chat_id)
+		if user_id not in admins or not message.text:
+			await del_msg_delay(await message.reply("Только админ может принять решение."))
+			return True
+
+		text_lower = message.text.lower()
+		if "принят" in text_lower:
+			await user_lock_unlock(verified_user_id, chat_id, st="unlock")
+			user_obj = await bot.get_chat(chat_id=verified_user_id)
+			FNAME = get_user_markdown_link(user_obj)
+			hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте {FNAME}, нового участника! 👋\n").replace('FNAME', FNAME)
+			await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+			await cleanup_verification_data(chat_id, verified_user_id)
+			
+		elif "бан" in text_lower:
+			reason = f"команда 'бан' от администратора {message.from_user.full_name}"
+			await apply_progressive_ban(chat_id, verified_user_id, reason)
+			try:
+				banned_user_obj = await bot.get_chat(verified_user_id)
+				banned_user_link = get_user_markdown_link(banned_user_obj)
+				admin_user_link = get_user_markdown_link(message.from_user)
+				kick_message_text = await kick_msg(admin_user_link, banned_user_link, False)
+				ban_msg = await bot.send_message(chat_id, kick_message_text, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+				asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
+				
+			except Exception as e:
+				logging.error(f"Ошибка при отправке сообщения о бане: {e}")
+			await message.delete()
+			await cleanup_verification_data(chat_id, verified_user_id)
+		else:
+			await del_msg_delay(await message.reply("Можно только 'Принят!' или 'Бан!'."))
+		return True
 
 	return False # Это обычное сообщение, не связанное с верификацией
 
