@@ -39,9 +39,28 @@ from google import genai
 from google.genai import types as gtypes
 
 
+# Настройка логирования с таймзоной UTC+10
+class TzFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created) + timedelta(hours=10)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+
 # Настройка базовой конфигурации логирования
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', 
-					level=logging.INFO)
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+formatter = TzFormatter(log_format)
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if root_logger.hasHandlers():
+    root_logger.handlers.clear()
+root_logger.addHandler(handler)
+
+# Уменьшение уровня логирования для apscheduler, чтобы не спамил в лог
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
 
 # Загрузка конфигурации
 load_dotenv()
@@ -414,7 +433,7 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 	chat_id_str = str(chat_id)[4:]
 	turl = f"t.me/{chat.username}/" if chat.username else f"t.me/c/{chat_id_str}/"
 	if last_sum_id: 
-		surl = f'Предыдущий свод [тут]({turl}{last_sum_id})'
+		surl = f'Предыдущий свод [тут]({turl}{last_sum_id})' # Используем стандартный Markdown
 	else:
 		surl = ''
 
@@ -439,12 +458,13 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 
 		logging.info(f"Ответ gpt4: получен. Длина {len(summary)}")
 		await r.lpush('gpt_answ_t', json.dumps(summary))
+		await r.ltrim('gpt_answ_t', 0, 14) # Храним последние 15 записей
 
 		if typing_task:
 			typing_task.cancel()
 		
 		# <--- 4. Используем bot.send_message для отправки в target_chat_id
-		sum_text = f"📝 #Суммаризация последних {final_count} сообщений:\n{summary}"
+		sum_text = f"📝 \#Суммаризация последних {final_count} сообщений:\n{summary}"
 		if surl and not privat: # Добавляем ссылку на пред. свод только если постим в чат
 			sum_text += f"\n{surl}"
 
@@ -452,9 +472,8 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 			chat_id=target_chat_id,
 			text=sum_text,
 			disable_web_page_preview=True,
-			parse_mode=ParseMode.MARKDOWN
+			parse_mode=ParseMode.MARKDOWN_V2
 		)
-
 	# <--- 5. Обработка ошибки, если бот не может написать в личку
 	except TelegramForbiddenError:
 		logging.error(f"Не удалось отправить сообщение пользователю {user.id}. Бот заблокирован или чат не начат.")
@@ -543,9 +562,12 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 	#первая строка должна быть такой: `--- cut here ---` будет служить для "отрезки лишнего"
 	#turl = "t.me/chatname/"
 	prompt=f"""
-**Роль:** Ты — AI-ассистент, который умеет делать краткие и остроумные пересказы диалогов из Telegram-чатов.
+**Роль:** Ты — AI-ассистент, который создаёт краткие и остроумные пересказы диалогов из Telegram-чатов в формате Markdown.
 
-**Задача:** Проанализируй предоставленный фрагмент чата в формате JSON и создай на его основе пост для Telegram в формате Markdown, следуя правилам ниже.
+**Задача:** Проанализируй предоставленный фрагмент чата в формате JSON и создай на его основе пост для Telegram, следуя правилам ниже.
+
+**Форматирование**
+1. Используй стандартный Markdown: `**жирный**`, `*курсив*`, `> цитаты`, списки с `*` или `-`.
 
 **Контекст и входные данные:**
 В твоем распоряжении базовая ссылка на чат и json строки :
@@ -576,7 +598,7 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 
 **ТРЕБОВАНИЯ К ОТЧЁТУ (СЛУШАЙ ВНИМАТЕЛЬНО!):**
 
-Твой пересказ — это крутой пост в TG Markdown.
+Твой пересказ — это крутой пост в TG.
 
 1.  **Заголовок с эмодзи.** Никаких "Названий темы". Вместо этого — **жирный заголовок и 1-3 подходящих по смыслу эмодзи**.
 
@@ -589,8 +611,7 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 	  * Если `user_name` равен `None`, имя пишется просто текстом (можно жирным), без ссылки. Например, для "Vasili Petrovich" с `user_name: None` ты напишешь просто **Василий**.
 	  * При **повторных** упоминаниях этого же пользователя в этой же сводке ссылка больше **не нужна**. Имя можно выделить жирным для акцента.
 	  * Экранируй спец символы в именах, к примнру Вас_Я приводи к Вас\_Я или исправляй на ВасЯ
-	  * Пример: ...а [Иван](t.me/van) в ... или ... попросили [Романа](t.me/Roman) сделать ... или ... упомянув [Лену✨](t.me/Lane) в ...
-
+	  * Пример: ...а **Иван** в ... или ... попросили **Романа** сделать ... или ... упомянув **Лену** в ...
 4.  **Ссылки на сообщения.**
 
 	  * Вместо скучных `[id:...]` делай живую ссылку прямо из ключевой фразы в тексте (1-3 слова).
@@ -610,12 +631,7 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 
 **И ОБЯЗАТЕЛЬНО ПОВТОРНО ПРОВЕРЬ перед отправкой:**
 1. Длину пересказа (7й пункт требований)
-2. Разметку на соответств TG Markdown и экранирование незакрытых символов (`_`, `*`, `[`, `]`, `(`, `)`)
-3. Корректность и видимость ссылок (4й пункт требований)
-"""
-
-	# await r.lpush('gpt_answ', json.dumps(text).encode('utf-8'))
-	# logging.info(text[:50])  # Логируем первые 50 символов текста
+2. Корректность и видимость ссылок (4й пункт требований)"""
 	try:
 		response = await gclient.aio.models.generate_content(
 			model="gemini-2.5-flash",
@@ -623,12 +639,12 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 				tools=[
 					gtypes.Tool(url_context=gtypes.UrlContext()),
 				],
-				thinking_config=gtypes.ThinkingConfig(thinking_budget=-1),
+				thinking_config=gtypes.ThinkingConfig(thinking_budget=13000),
 				system_instruction=prompt,  # Системная инструкция
 				),
 			contents=json.dumps(text),  # Описание, текст в формате JSON
 			)
-		
+
 		# Сохраняем успешный ответ для отладки
 		try:
 			debug_info = {
@@ -643,7 +659,7 @@ async def get_gpt4_summary(text: list, turl: str) -> str | None:
 		except Exception as redis_e:
 			logging.error(f"Не удалось записать отладочную информацию в Redis: {redis_e}")
 
-		return response.text
+		return markdown_to_tg_v2(response.text)
 
 	except Exception as e:
 		logging.error(f"Произошла ошибка при обращении к Gemini: {e}", exc_info=True)
@@ -1092,20 +1108,150 @@ def humanize_value_for_chars(num: int) -> str: # Переименовано
 	else:
 		return str(num)
 
+
+def escape_markdown_v2_smart(text: str) -> str:
+    """
+    Экранирует символы MarkdownV2, не трогая уже экранированные.
+    """
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    escaped = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        # если уже экранировано — не трогаем
+        if c == "\\" and i + 1 < len(text) and text[i + 1] in escape_chars:
+            escaped.append(c)
+            escaped.append(text[i + 1])
+            i += 2
+            continue
+        if c in escape_chars:
+            escaped.append("\\" + c)
+        else:
+            escaped.append(c)
+        i += 1
+    return "".join(escaped)
+
+
+def _detect_preescaped(text: str) -> bool:
+    """
+    Определяет, содержит ли текст уже экранирование MarkdownV2.
+    Эвристика: если доля `\` > 0.5% от длины — считаем экранированным.
+    """
+    if not text:
+        return False
+    count = text.count("\\")
+    ratio = count / len(text)
+    return ratio > 0.005
+
+# Для разбивки текста на части по лимиту Telegram
+# на будущие
+TG_MAX_LENGTH = 4096
+def _split_tg_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
+    """Разбивает текст по лимиту Telegram (4096 символов)."""
+    if len(text) <= max_len:
+        return [text]
+    parts, current = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > max_len:
+            parts.append(current.strip())
+            current = line
+        else:
+            current += line
+    if current:
+        parts.append(current.strip())
+    return parts
+
+
+def markdown_to_tg_v2(text: str) -> str:
+    """
+    Преобразует markdown в Telegram MarkdownV2 формат.
+
+    Поддерживает:
+      - # Заголовки
+      - **жирный**, *курсив*
+      - Списки (-, +, *)
+      - Цитаты (>)
+      - Ссылки [текст](url)
+      - Блоки кода
+    """
+    escape = escape_markdown_v2_smart
+
+    lines = text.splitlines()
+    result = []
+    in_code_block = False
+
+    for line in lines:
+        if not line.strip(): # Пропускаем пустые строки, сохраняя перенос
+            result.append("")
+            continue
+        # Блоки кода
+        if re.match(r"^\s*```", line):
+            in_code_block = not in_code_block
+            result.append("```" if in_code_block else "```")
+            continue
+
+        if in_code_block:
+            result.append(line) # Внутри блока кода ничего не экранируем
+            continue
+
+        # Заголовки
+        if line.startswith("#"):
+            level = len(line) - len(line.lstrip("#"))
+            title = line[level:].strip()
+            title = escape(title)
+            if level == 1: # H1 -> *BOLD*
+                result.append(f"*{title.upper()}*\n")
+            elif level == 2: # H2 -> _italic_
+                result.append(f"_{title}_\n")
+            else: # H3+ -> • bullet
+                result.append(f"• {title}\n")
+            continue
+
+        # Цитаты
+        if line.strip().startswith(">"):
+            content = escape(line.lstrip(">").strip())
+            result.append(f"> {content}")
+            continue
+
+        # Списки
+        if re.match(r"^\s*([-*+])\s+", line):
+            item = re.sub(r"^\s*([-*+])\s+", "", line)
+            result.append(f"• {escape(item)}")
+            continue
+
+        # --- Новая логика обработки строки с форматированием ---
+        # Разбиваем строку по элементам форматирования (ссылки, жирный, курсив)
+        # и экранируем только обычный текст между ними.
+        parts = re.split(r'(\[.*?\]\(.*?\))|(\*\*.*?\*\*)|(\*.*?\*)', line)
+        processed_line = []
+        for part in parts:
+            if not part: continue
+
+            if part.startswith('[') and part.endswith(')'): # Ссылка [текст](url)
+                match = re.match(r'\[(.*?)\]\((.*?)\)', part)
+                if match:
+                    processed_line.append(f"[{escape(match.group(1))}]({match.group(2)})")
+            elif part.startswith('**') and part.endswith('**'): # Жирный **текст**
+                processed_line.append(f"*{escape(part[2:-2])}*")
+            elif part.startswith('*') and part.endswith('*'): # Курсив *текст*
+                processed_line.append(f"_{escape(part[1:-1])}_")
+            else: # Обычный текст
+                processed_line.append(escape(part))
+
+        result.append("".join(processed_line))
+
+    full_text = "\n".join(result).strip()
+    return full_text
+
 def get_user_markdown_link(user_or_chat: types.User | types.Chat) -> str:
 	"""
-	Создает Markdown-ссылку на пользователя (для parse_mode="Markdown").
+	Создает Markdown-ссылку на пользователя (для parse_mode=ParseMode.MARKDOWN_V2).
 	Безопасно экранирует спецсимволы в имени.
 	"""
-	def escape_markdown_v1(text: str) -> str:
-		if not text: return ""
-		# Экранируем только _ * [ ] ( ) `, оставляя остальные символы как есть
-		return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
-
 	full_name = getattr(user_or_chat, 'full_name', 'Unknown User')
 	user_id = user_or_chat.id
 	
-	escaped_name = escape_markdown_v1(full_name)
+	escaped_name = escape_markdown_v2_smart(full_name)
 	user_url = f"tg://user?id={user_id}"
 	
 	return f"[{escaped_name}]({user_url})"
@@ -1123,7 +1269,7 @@ async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 		response = await gclient.aio.models.generate_content(
 		model="gemini-2.5-flash",
 		contents=f"""
-**Задача:** Сгенерируй ОДНО короткое (до 20 слов) и язвительное сообщение-ШАБЛОН о том, что пользователь %%KOGO%% был кикнут пользователем %%KTO%%. И преукрась смайлами.
+**Задача:** Сгенерируй ОДНО короткое (до 20 слов) и язвительное сообщение о том, что пользователь '{kogo_name}' был кикнут пользователем '{kto_name}'. И преукрась смайлами.
 
 **Входные данные:**
 *   Кикнутый пользователь (Kogo): "{kogo_name}"
@@ -1131,18 +1277,20 @@ async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 *   Контекст (is_bot): {chel} (true, если кикнул бот; false, если админ)
 
 **Логика и Грамматика (ОЧЕНЬ ВАЖНО):**
-1.  Твоя задача — создать шаблон предложения, используя плейсхолдеры `%%KTO%%` и `%%KOGO%%`.
-2.  **Род:** Определи род `Kto` по его имени/нику. Если это женское имя ("Мария", "Нейросеть"), используй глаголы женского рода ("решила", "указала"). Если род неясен (ники вроде "admin", "dv_pod"), используй мужской род по умолчанию.
-3.  **Падежи:** Не склоняй плейсхолдеры! Просто вставь `%%KTO%%` и `%%KOGO%%` в нужные места.
-4.  **Контекст:** Если `is_bot` это `true`, высмей `Kogo` за то, что его выгнал бездушный бот `Kto`. Если `false`, высмей `Kogo` за то, что его изгнал могущественный админ `Kto`.
-
-**Примеры правильной обработки:**
-*   Входные: Kto: 'Мария', Kogo: 'user123' -> Ответ: "%%KTO%% элегантно указала %%KOGO%% на дверь."
-*   Входные: Kto: 'dv_pod', Kogo: 'новичок' -> Ответ: "%%KTO%% решил, что %%KOGO%% здесь явно лишний."
-*   Входные: Kto: 'Нейросеть', Kogo: 'Спамер' -> Ответ: "%%KTO%% сочла %%KOGO%% цифровым мусором и стерла его."
+1.  Твоя задача — создать готовое, грамматически корректное предложение.
+2.  **Род:** Определи род '{kto_name}' по его имени/нику. Если это женское имя ("Мария", "Нейросеть"), используй глаголы женского рода ("решила", "указала"). Если род неясен (ники вроде "admin", "dv_pod"), используй мужской род по умолчанию.
+3.  **Падежи:** Правильно склоняй имена '{kto_name}' и '{kogo_name}' в зависимости от контекста предложения.
+4.  **Контекст:** Если `is_bot` это `true`, высмей '{kogo_name}' за то, что его выгнал бездушный бот '{kto_name}'. Если `false`, высмей '{kogo_name}' за то, что его изгнал могущественный админ '{kto_name}'.
 
 **Финальное правило:**
-Твой ответ должен содержать ТОЛЬКО текст с плейсхолдерами `%%KTO%%` и `%%KOGO%%`. Никакого Markdown.
+Твой ответ должен быть строкой, готовой для отправки в Telegram с `parse_mode=MarkdownV2`.
+Это значит, что все зарезервированные символы (`.` `!` `-` `(` `)` и т.д.) в тексте, **кроме самих имен**, должны быть экранированы символом `\`.
+Например, если хочешь закончить предложение точкой, используй `\\.`.
+
+**Примеры правильной обработки:**
+*   Входные: Kto: 'Мария', Kogo: 'user123' -> Ответ: "Мария элегантно указала user123 на дверь\\."
+*   Входные: Kto: 'dv_pod', Kogo: 'новичок' -> Ответ: "dv_pod решил, что новичок здесь явно лишний\\!"
+*   Входные: Kto: 'Нейросеть', Kogo: 'Спамер' -> Ответ: "Нейросеть сочла Спамера цифровым мусором и стерла его\\."
 """,
 		)
 		# Получаем сгенерированный текст
@@ -1151,8 +1299,10 @@ async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 		if not generated_text:
 			raise ValueError("Empty response from AI")
 
-		# Заменяем плейсхолдеры на реальные данные (уже с Markdown-ссылками)
-		final_text = generated_text.replace("%%KTO%%", Kto).replace("%%KOGO%%", Kogo)
+		# Заменяем имена на Markdown-ссылки.
+		# Внимание: это может не сработать, если имя было сильно изменено при склонении.
+		# Однако, это лучше, чем некорректная грамматика.
+		final_text = generated_text.replace(kto_name, Kto).replace(kogo_name, Kogo)
 		return final_text
 	except Exception as e:
 		# Если ИИ не ответил или произошла ошибка, возвращаем стандартное сообщение
@@ -1255,7 +1405,15 @@ async def off_member(event: ChatMemberUpdated):
 		
 		# Генерируем и отправляем сообщение о бане (для ручных банов админами)
 		kick_message_text = await kick_msg(admin_user_link, kicked_user_link, event.from_user.is_bot)
-		await event.answer(kick_message_text, parse_mode="Markdown", disable_web_page_preview=True)
+		try:
+			await event.answer(kick_message_text, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+		except TelegramBadRequest as e:
+			if "can't parse entities" in str(e).lower():
+				logging.warning(f"Failed to send kick message due to markdown error. Falling back to simple message. Error: {e}")
+				fallback_text = f"👋 {admin_user_link} изгнал(а) пользователя {kicked_user_link}."
+				await event.answer(fallback_text, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+			else:
+				raise
 
 	elif isinstance(event.new_chat_member, ChatMemberLeft):
 		# Простое сообщение о том, что пользователь ушел сам (ранее не обрабатывалось)
@@ -1361,12 +1519,12 @@ async def new_member(event: ChatMemberUpdated):
 		await user_lock_unlock(user_id, chat_id, st="lock")
 		visit_message = await bot.send_message(
 			chat_id,
-			f"Ловите бота!\n"
-			f"Звать его - [{new_member.full_name}]({new_member.url})!\n"
-			f"Примите или забаньте!\n",
-			parse_mode="Markdown"
+			f"Ловите бота\!\n"
+			f"Звать его - [{escape_markdown_v2_smart(new_member.full_name)}]({new_member.url})\!\n"
+			f"Примите или забаньте\!\n",
+			parse_mode=ParseMode.MARKDOWN_V2
 		)
-
+		
 async def generate_image_description(image: Image.Image) -> bool | None:
 	"""
 	Определяет, есть ли на картинке велосипед.
@@ -1389,29 +1547,29 @@ async def generate_image_description(image: Image.Image) -> bool | None:
 
 ## Ограничиваем возможности пользователя (блокируем отправку сообщений) | расширеный
 async def user_lock_unlock(user_id: int, chat_id: int, **kwargs):
-	now = datetime.now()
-	duration = timedelta(seconds=15)
-	future_date = now + duration
 	try:
 		if kwargs['st'] == 'lock':  # Блокировка
 			await bot.restrict_chat_member(
 				chat_id=chat_id,
 				user_id=user_id,
 				permissions=ChatPermissions(
-					can_send_photos=True # Разрешаем только фото для проверки
+					can_send_photos=True, # Разрешаем только фото для проверки
 				),
 				until_date=0  # 0 или None – ограничение бессрочное
 			)
 			logging.info(f"{user_id} - Отправка сообщений заблокирована.")
 
 		elif kwargs['st'] == "unlock":  # Разблокировка
-			# Снимаем все ограничения, возвращая стандартные права после 15 сек.
+			# Снимаем все ограничения, возвращая стандартные права
 			await bot.restrict_chat_member(
 				chat_id=chat_id,
 				user_id=user_id,
-				permissions=ChatPermissions(can_send_messages=True),
-				until_date=future_date)
-			logging.info(f"{user_id} - Отправка сообщений разблокирована.")     
+				until_date=datetime.now() + timedelta(seconds=45),  # ограничение на 45 секунд
+				permissions=ChatPermissions(
+					can_send_messages=True,					
+				)
+			)
+			logging.info(f"{user_id} - Отправка сообщений разблокирована.")
 
 	except Exception as e:
 		logging.error(f"Error: {e}", exc_info=True)
@@ -1469,8 +1627,8 @@ async def check_new_members():
 					chat_id_str = str(chat_id)[4:] if str(chat_id).startswith('-100') else str(chat_id)
 					reminder = await bot.send_message(
 						chat_id=int(chat_id),
-						text=f"⏰ [{user_nm}](tg://user?id={user_id}), не забудь пройти проверку!\nОсталось {int((TIME_TO_BAN_SECONDS - time_elapsed)//60)} мин. до 👢💥🍑.\nОтветь на [запрос бота](https://t.me/c/{chat_id_str}/{msg_id})",
-						parse_mode="Markdown"
+						text=f"⏰ [{escape_markdown_v2_smart(user_nm)}](tg://user?id={user_id}), не забудь пройти проверку\!\nОсталось {int((TIME_TO_BAN_SECONDS - time_elapsed)//60)} мин\. до 👢💥🍑\.\nОтветь на [запрос бота](https://t.me/c/{chat_id_str}/{msg_id})",
+						parse_mode=ParseMode.MARKDOWN_V2
 					)
 					data['notified'] = True
 					data['reminder_id'] = reminder.message_id
@@ -1491,12 +1649,25 @@ async def check_new_members():
 
 					kick_message_text = await kick_msg(bot_link, kicked_user_link, True)
 
-					ban_msg = await bot.send_message(
-						chat_id=int(chat_id),
-						text=kick_message_text,
-						parse_mode="Markdown",
-						disable_web_page_preview=True
-					)
+					try:
+						ban_msg = await bot.send_message(
+							chat_id=int(chat_id),
+							text=kick_message_text,
+							parse_mode=ParseMode.MARKDOWN_V2,
+							disable_web_page_preview=True
+						)
+					except TelegramBadRequest as e:
+						if "can't parse entities" in str(e).lower():
+							logging.warning(f"Failed to send kick message due to markdown error. Falling back to simple message. Error: {e}")
+							fallback_text = f"👋 {bot_link} изгнал(а) пользователя {kicked_user_link}."
+							ban_msg = await bot.send_message(
+								chat_id=int(chat_id),
+								text=fallback_text,
+								parse_mode=ParseMode.MARKDOWN_V2,
+								disable_web_page_preview=True
+							)
+						else:
+							raise
 
 					# Запускаем отложенное удаление сообщения о бане
 					asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
@@ -1568,7 +1739,10 @@ async def _handle_verification_message(message: Message) -> bool:
 	if is_user_under_verification:
 		# ПРАВИЛО 1: Пересланное фото от нового юзера -> немедленный бан.
 		if message.photo and (message.forward_from or message.forward_from_chat):
-			await message.delete()
+			try:
+				await message.delete()
+			except TelegramBadRequest as e:
+				if "message to delete not found" not in str(e).lower(): raise
 			await apply_progressive_ban(chat_id, user_id, "пересланное фото от нового пользователя")
 			await cleanup_verification_data(chat_id, user_id)
 			# await message.answer('Вы были забанены за пересланное фото. Новым пользователям запрещено отправлять пересланные фото.')
@@ -1592,7 +1766,7 @@ async def _handle_verification_message(message: Message) -> bool:
 							if member_status.status not in ("left", "kicked", "banned"):
 								await user_lock_unlock(user_id, chat_id, st="unlock")
 								user_obj = await bot.get_chat(chat_id=user_id)
-								FNAME = get_user_markdown_link(user_obj)
+								FNAME = get_user_markdown_link(user_obj) # get_user_markdown_link уже экранирует
 								hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте {FNAME}, нового участника! 👋\n").replace('FNAME', FNAME)
 								await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 								await cleanup_verification_data(chat_id, user_id)
@@ -1602,11 +1776,17 @@ async def _handle_verification_message(message: Message) -> bool:
 						elif description is False:
 							# AI сказал "False" - велосипеда нет
 							await message.reply("На этой картинке нет велосипеда. Попробуй другую. 🚲")
-							await message.delete()
+							try:
+								await message.delete()
+							except TelegramBadRequest as e:
+								if "message to delete not found" not in str(e).lower(): raise
 						else:
 							# description is None - ошибка или неожиданный ответ
 							await message.reply("Не удалось распознать изображение. Пожалуйста, попробуйте отправить другую, более четкую картинку.")
-							await message.delete()
+							try:
+								await message.delete()
+							except TelegramBadRequest as e:
+								if "message to delete not found" not in str(e).lower(): raise
 					except Exception as e:
 						logging.error(f"Ошибка при обработке фото для верификации: {e}", exc_info=True)
 						await message.reply(f"Не удалось обработать фото. Попробуйте еще раз.")
@@ -1614,7 +1794,10 @@ async def _handle_verification_message(message: Message) -> bool:
 
 		# ПРАВИЛО 3: Любое другое сообщение от пользователя на верификации -> удаление и напоминание.
 		if message.photo:
-			await message.delete()
+			try:
+				await message.delete()
+			except TelegramBadRequest as e:
+				if "message to delete not found" not in str(e).lower(): raise
 			await message.answer('Пожалуйста, отправьте фото в ответ на сообщение бота.')
 		return True
 
@@ -1641,7 +1824,7 @@ async def _handle_verification_message(message: Message) -> bool:
 		if "принят" in text_lower:
 			await user_lock_unlock(verified_user_id, chat_id, st="unlock")
 			user_obj = await bot.get_chat(chat_id=verified_user_id)
-			FNAME = get_user_markdown_link(user_obj)
+			FNAME = get_user_markdown_link(user_obj) # get_user_markdown_link уже экранирует
 			hell_msg = (await r.get(f"chat:{chat_id}:Hello_msg") or f"Поприветствуйте {FNAME}, нового участника! 👋\n").replace('FNAME', FNAME)
 			await message.answer(hell_msg, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 			await cleanup_verification_data(chat_id, verified_user_id)
@@ -1675,7 +1858,7 @@ async def save_group_message(message: Message):
 		return # Если сообщение было частью верификации, прекращаем обработку
 
 	# --- 2. Обработка обычных сообщений ---
-	logging.info(f"Processing regular message in chat {message.chat.id}")
+	logging.debug(f"Processing regular message in chat {message.chat.id}")
 	user = message.from_user
 	chat = message.chat
 	chat_nm = chat.title
@@ -1749,7 +1932,7 @@ async def save_group_message(message: Message):
 		
 		await pipe.execute()
 
-	logging.info(f"Message {message.message_id} saved and stats updated for period {current_period} in {chat_nm}")
+	logging.debug(f"Message {message.message_id} saved and stats updated for period {current_period} in {chat_nm}")
 
 @dp.edited_message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), ~F.text.startswith('/'))
 async def handle_edited_message(message: Message):

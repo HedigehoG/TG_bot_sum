@@ -1,0 +1,8 @@
+apscheduler
+redis
+python-dotenv
+aiogram
+Pillow
+imagehash
+google-genai
+debugpy
