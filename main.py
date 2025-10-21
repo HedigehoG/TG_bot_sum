@@ -105,6 +105,13 @@ CLEANUP_AFTER_MINUTES = 10  # Через сколько минут удалят�
 CLEANUP_AFTER_SECONDS = CLEANUP_AFTER_MINUTES * 60
 EDIT_SEARCH_DEPTH = 200 # Глубина поиска в истории для обновления отредактированных сообщений
 
+# --- КОНСТАНТЫ ---
+SECONDS_IN_DAY = 86400
+SUMMARIZE_LOCK_EXPIRY_SECONDS = 300
+ADMIN_CACHE_EXPIRY_SECONDS = 60
+TYPING_ACTION_INTERVAL_SECONDS = 4
+
+
 # Инициализация 
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -117,7 +124,7 @@ async def init_redis():
 	global r
 	try:
 		r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)  # Изменено
-		# Проверка соединения
+		# Проверка соединения.
 		await r.ping()
 		logging.info("Connected to Redis successfully")
 	except Exception as e:
@@ -145,7 +152,7 @@ async def get_admins(chat_id: int, force_refresh: bool = False) -> set:
 	# Сохраняем в кеш
 	if admin_ids:
 		await r.sadd(cache_key, *[str(id) for id in admin_ids])
-		await r.expire(cache_key, 60) # Кеш на 60 секунд
+		await r.expire(cache_key, ADMIN_CACHE_EXPIRY_SECONDS) # Кеш на 60 секунд
 	return admin_ids
 
 # Конвертер секунд
@@ -192,6 +199,27 @@ async def run_info(message: Message, started_at: str):
 async def cmd2(message: Message):
 	await message.answer("1")
 
+# Новая команда для отладки
+@dp.message(Command("d2"))
+async def debug_message(message: Message):
+	"""
+	Выводит полную информацию о сообщении в лог для отладки.
+	Работает только для администратора.
+	Если команда вызвана в ответ на сообщение, выводится информация об отвеченном сообщении.
+	"""
+	if message.from_user.id != ADMIN_ID:
+		await message.reply("Эта команда доступна только администратору.")
+		return
+
+	target_message = message.reply_to_message or message
+	
+	# Используем model_dump_json для красивого и полного вывода Pydantic модели (aiogram 3.x)
+	message_info_json = target_message.model_dump_json(indent=2, exclude_none=True)
+	
+	logging.info(f"--- DEBUG INFO FOR MESSAGE ID: {target_message.message_id} ---")
+	logging.info(message_info_json)
+	
+	await message.reply(f"✅ Информация о сообщении <code>{target_message.message_id}</code> выведена в лог консоли.")
 
 # Проверка прав
 @dp.message(Command("right"))
@@ -455,7 +483,7 @@ async def process_summarize(message: Message, count=0, start=0, privat: bool = F
 		async def send_typing_periodically():
 			"""Отправляет 'typing' каждые 4 секунды, пока не будет отменена."""
 			while True:
-				await bot.send_chat_action(target_chat_id, action="typing")
+				await bot.send_chat_action(target_chat_id, action="typing") # Отправляем "typing"
 				await asyncio.sleep(4) # Пауза 4 секунды (безопасно меньше лимита Telegram)
 
 		typing_task = asyncio.create_task(send_typing_periodically())
@@ -587,11 +615,11 @@ async def upd_daily_limit(chat_id: int, user_id: int, privat:bool):
 
 	async with r.pipeline() as pipe:
 		pipe.incr(user_key)
-		pipe.expire(user_key, 86400 // SEND_MES)
+		pipe.expire(user_key, SECONDS_IN_DAY // SEND_MES)
 		
 		if not privat:
 			pipe.incr(group_key)
-			pipe.expire(group_key, 86400 // SEND_MES_GROUP)
+			pipe.expire(group_key, SECONDS_IN_DAY // SEND_MES_GROUP)
 		
 		await pipe.execute()
 
@@ -939,6 +967,7 @@ async def check_bayan(message: Message):
 						['CgACAgQAAxkBAAIDD2f9xJ5wVliPMOyIkLBYFIjVyckiAALEOQAC7hdkB6taFHfHHCwtNgQ'], # в сене находит
 						['CgACAgQAAxkBAAIDEGf9xrNV-0FR9CwXnRTzR9as3lOyAALpAgACdgQUUx8P27eBaYgLNgQ'], # Джери
 						['CgACAgQAAxkBAAIDEWf9x0Z0QSCD0eWCudKndoLwIHaTAAJSAwAC-RAEU2Tw7_4c3dtnNgQ'], # Пингвин
+						['CgACAgIAAyEFAASJUrtlAAII3Gj3T4LlBDxgEqzif7KBQVOQpCLSAAJ2AAPD8JlIrbepiRS69Qk2BA'], # Круз
 						['CgACAgQAAxkBAAIDGmf9z3yk_q374r08VTF5MVgqE0UgAAIlAwAClTENU85HwIjkanSyNgQ']) # Мужик
 			gif_id = (random.choice(gif_list))[0]
 			# Для приватной супергруппы убираем префикс "-100"
@@ -1210,7 +1239,7 @@ def escape_markdown_v2_smart(text: str) -> str:
     return "".join(escaped)
 
 
-def _detect_preescaped(text: str) -> bool:
+def _detect_preescaped(text: str) -> bool: # Эта функция не используется
     """
     Определяет, содержит ли текст уже экранирование MarkdownV2.
     Эвристика: если доля `\` > 0.5% от длины — считаем экранированным.
@@ -1368,7 +1397,7 @@ async def kick_msg(Kto: str, Kogo: str, chel: bool) -> str:
 
 **Финальное правило:**
 Твой ответ должен быть строкой, готовой для отправки в Telegram с `parse_mode=MarkdownV2`.
-Это значит, что все зарезервированные символы (`.` `!` `-` `(` `)` и т.д.) в тексте, **кроме самих имен**, должны быть экранированы символом `\`.
+Это значит, что все зарезервированные символы (`_`, `*`, `[`, `]`, `(`, `)`, `~`, `\``, `>`, `#`, `+`, `-`, `=`, `|`, `{{`, `}}`, `.`, `!`) в тексте, **кроме самих имен**, должны быть экранированы символом `\`.
 Например, если хочешь закончить предложение точкой, используй `\\.`.
 
 **Примеры правильной обработки:**
@@ -1402,9 +1431,9 @@ async def apply_progressive_ban(chat_id: int, user_id: int, reason_log: str):
         # Увеличиваем счетчик банов для пользователя
         ban_count = await r.incr(key)
         
-        # Устанавливаем TTL на 1 год при первом нарушении, чтобы счетчик сбрасывался
+        # Устанавливаем TTL на 1 год при первом нарушении, чтобы счетчик сбрасывался (366 дней для запаса)
         if ban_count == 1:
-            await r.expire(key, int(timedelta(days=366).total_seconds()))
+            await r.expire(key, int(timedelta(days=31).total_seconds()))
 
         now = datetime.now()
         
@@ -1491,13 +1520,13 @@ async def off_member(event: ChatMemberUpdated):
         except TelegramBadRequest as e:
             if "can't parse entities" in str(e).lower():
                 logging.warning(f"Failed to send kick message due to markdown error. Falling back to simple message. Error: {e}")
-                fallback_text = f"👋 {admin_user_link} изгнал(а) пользователя {kicked_user_link}."
+                fallback_text = f"👋 {admin_user_link} изгнал(а) пользователя {kicked_user_link}\."
                 await event.answer(fallback_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
             else:
                 raise
 
     elif isinstance(event.new_chat_member, ChatMemberLeft):
-        # Простое сообщение о том, что пользователь ушел сам (ранее не обрабатывалось)
+		# Обычный выход пользователя
         await event.answer(f"👋 Гудбай {get_user_markdown_link(member)}", parse_mode="MarkdownV2", disable_web_page_preview=True)
 
 # Обработчик новых участников
@@ -1512,7 +1541,7 @@ async def new_member(event: ChatMemberUpdated):
     if not new_member.is_bot:
         # --- НОВАЯ ЛОГИКА: Регистрация пользователя в списке ожидания ---
         countdown_key = f"chat:{chat_id}:in_countdown"
-        await r.sadd(countdown_key, user_id)
+        await r.sadd(countdown_key, user_id) # Добавляем пользователя в сет отсчета
         await r.expire(countdown_key, 60) # 60 секунд - с запасом
 
         await user_lock_unlock(user_id, chat_id, st="lock")
@@ -1726,7 +1755,7 @@ async def check_new_members():
                     data['reminder_id'] = reminder.message_id
                     await r.hset(key, user_id, json.dumps(data))
 
-                if time_elapsed > TIME_TO_BAN_SECONDS:
+                if time_elapsed >= TIME_TO_BAN_SECONDS: # Изменено на >= для точности
                     user_nm = data.get('full_name', f'user_{user_id}')
                     # Применяем прогрессивный бан
                     reason = f"провал проверки ({user_nm})"
@@ -1904,7 +1933,7 @@ async def _handle_verification_message(message: Message) -> bool:
         # Проверяем, что проверка ещё активна
         if not await r.hexists(key_u_j, verified_user_id):
             await del_msg_delay(await message.reply("Уже всё, поздно 😏"))
-            return True
+            return True # Сообщение обработано
 
         admins = await get_admins(chat_id)
         if user_id not in admins or not message.text:
@@ -1928,11 +1957,21 @@ async def _handle_verification_message(message: Message) -> bool:
                 banned_user_link = get_user_markdown_link(banned_user_obj)
                 admin_user_link = get_user_markdown_link(message.from_user)
                 kick_message_text = await kick_msg(admin_user_link, banned_user_link, False)
-                ban_msg = await bot.send_message(chat_id, kick_message_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+                
+                try:
+                    ban_msg = await bot.send_message(chat_id, kick_message_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+                except TelegramBadRequest as e:
+                    if "can't parse entities" in str(e).lower():
+                        logging.warning(f"Failed to send kick message due to markdown error. Falling back to simple message. Error: {e}")
+                        fallback_text = f"👋 {admin_user_link} изгнал(а) пользователя {banned_user_link}\."
+                        ban_msg = await bot.send_message(chat_id, fallback_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+                    else:
+                        raise # Перебрасываем другие ошибки
+                
                 asyncio.create_task(del_msg_delay(ban_msg, CLEANUP_AFTER_SECONDS))
                 
-            except Exception as e: # Добавлено exc_info=True для полного стека ошибки
-                logging.error(f"Error sending ban message in _handle_verification_message: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"Error preparing or sending ban message in _handle_verification_message: {e}", exc_info=True)
             try:
                 await message.delete()
             except TelegramBadRequest as e:
